@@ -1,6 +1,12 @@
-# Amazon Connect resource export/import (primitive APIs)
+# Amazon Connect bundle export/import (primitive APIs)
 
-This folder contains a small Python CLI to export/import a JSON bundle using Connect’s primitive APIs.
+This folder contains a Python CLI (boto3) to export/import a JSON “bundle” using Amazon Connect’s primitive APIs.
+
+## Scope (bundle v1)
+- Hours of operation
+- Queues (STANDARD)
+- Contact flow modules
+- Contact flows
 
 ## Install
 ```bash
@@ -11,8 +17,6 @@ pip install -r requirements.txt
 ```
 
 ## Export a bundle
-Exports Contact Flow Modules + Contact Flows (including the JSON `Content` fields):
-
 ```bash
 python connect_instance_replicate.py export \
   --region us-east-1 \
@@ -20,28 +24,38 @@ python connect_instance_replicate.py export \
   --out bundle.json
 ```
 
-## Import a bundle
-Imports into an *existing* target instance. By default it skips resources that already exist (matched by name).
+## Import a bundle (dry-run)
+Shows what would be created/updated/skipped without calling `Create*`/`Update*`.
 
-```bash
-python connect_instance_replicate.py import \
-  --region us-west-2 \
-  --instance-id <TARGET_INSTANCE_ID> \
-  --in bundle.json
-```
-
-To overwrite existing flows/modules (update content):
 ```bash
 python connect_instance_replicate.py import \
   --region us-west-2 \
   --instance-id <TARGET_INSTANCE_ID> \
   --in bundle.json \
-  --overwrite
+  --overwrite \
+  --dry-run
 ```
 
+## Import a bundle (live)
+```bash
+python connect_instance_replicate.py import \
+  --region us-west-2 \
+  --instance-id <TARGET_INSTANCE_ID> \
+  --in bundle.json \
+  --overwrite \
+  --continue-on-error \
+  --skip-unsupported
+```
+
+### Flags
+- `--overwrite`: update resources if they already exist (matched by name)
+- `--dry-run`: do not call Create/Update, only report planned actions
+- `--continue-on-error`: keep going and record failures instead of aborting the whole import
+- `--skip-unsupported`: skip flows/modules that reference prompts/Lex/Lambda/S3/phone numbers (external deps)
+
 ## Notes / limitations
-- This does not create a new instance; it copies resources between existing instances.
-- Flow JSON can reference queues/prompts/routing profiles/etc by ID/ARN; this tool only attempts limited rewriting for flows/modules.
+- This CLI does **not** create a new Connect instance; it copies supported resources into an existing instance.
+- Flow JSON often contains embedded IDs/ARNs. The importer rewrites known IDs/ARNs (hours/queues/modules/flows) best-effort and uses a two-pass flow update.
 
 References:
 - Admin guide (flow import/export): https://docs.aws.amazon.com/connect/latest/adminguide/contact-flow-import-export.html
