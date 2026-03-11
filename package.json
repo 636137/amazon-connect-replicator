@@ -1,0 +1,14 @@
+{
+  "name": "amazon-connect-replicator",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n api,ui -c cyan,magenta \"npm run dev -w @acr/api\" \"npm run dev -w @acr/ui\"",
+    "build": "npm run build -w @acr/api && npm run build -w @acr/ui"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0"
+  }
+}
