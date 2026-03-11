@@ -1,6 +1,6 @@
 ---
 name: connect-instance-replication
-description: Replicate Amazon Connect instance configuration across regions using primitive APIs. Exports/imports 19 resource types including Lambda/Lex with automatic ARN replacement.
+description: Replicate Amazon Connect instance configuration across regions using primitive APIs. Exports/imports 19 resource types including Lambda/Lex with automatic ARN replacement and optional cross-region copy.
 user-invocable: true
 disable-model-invocation: false
 ---
@@ -22,7 +22,7 @@ This skill **always replicates into a pre-existing target instance**. It does NO
 
 Provision your target instance in advance, then use this skill to sync configuration.
 
-## Bundle v3.1 Scope (19 resource types)
+## Bundle v3.2 Scope (19 resource types)
 
 The replicator exports and imports these resource types in dependency-aware order:
 
@@ -35,18 +35,20 @@ The replicator exports and imports these resource types in dependency-aware orde
 | 5 | Queues (STANDARD) | Call/chat routing queues | CreateQueue / UpdateQueueHoursOfOperation |
 | 6 | Routing Profiles | Queue priority assignments | CreateRoutingProfile / UpdateRoutingProfileQueues |
 | 7 | Quick Connects | One-click transfer destinations | CreateQuickConnect / UpdateQuickConnectConfig |
+| 7a | **Prompts** | Audio prompts (with S3 copy) | CreatePrompt |
 | 8 | Contact Flow Modules | Reusable flow components | CreateContactFlowModule / UpdateContactFlowModuleContent |
 | 9 | Contact Flows | IVR and routing logic | CreateContactFlow / UpdateContactFlowContent |
 | 10 | Instance Attributes | Instance-level settings | UpdateInstanceAttribute |
 | 11 | Predefined Attributes | Contact attribute definitions | CreatePredefinedAttribute / UpdatePredefinedAttribute |
-| 12 | Prompts | Audio prompts (with S3 copy) | CreatePrompt |
-| 13 | Task Templates | Structured task definitions | CreateTaskTemplate / UpdateTaskTemplate |
-| 14 | Views | Custom agent UI views | CreateView / UpdateViewContent |
-| 15 | Rules | Automation rules and triggers | CreateRule / UpdateRule |
-| 16 | Evaluation Forms | Quality management forms | CreateEvaluationForm |
-| 17 | Vocabularies | Custom speech recognition | CreateVocabulary |
-| 18 | **Lambda Functions** | Serverless integrations | ListLambdaFunctions / AssociateLambdaFunction |
-| 19 | **Lex Bots (V1/V2)** | Conversational AI bots | ListBots / AssociateBot / AssociateLexBot |
+| 12 | Task Templates | Structured task definitions | CreateTaskTemplate / UpdateTaskTemplate |
+| 13 | Views | Custom agent UI views | CreateView / UpdateViewContent |
+| 14 | Rules | Automation rules and triggers | CreateRule / UpdateRule |
+| 15 | Evaluation Forms | Quality management forms | CreateEvaluationForm |
+| 16 | Vocabularies | Custom speech recognition | CreateVocabulary |
+| 17 | **Lambda Functions** | Serverless integrations | ListLambdaFunctions / AssociateLambdaFunction |
+| 18 | **Lex Bots (V1/V2)** | Conversational AI bots | ListBots / AssociateBot / AssociateLexBot |
+
+**Note:** Prompts are processed at step 7a (before flows) to ensure prompt ARN replacements are available when processing flow content.
 
 ## Key Features
 
@@ -55,12 +57,27 @@ Automatically discovers Lambda functions and Lex bots associated with the source
 - `ListLambdaFunctions` - Gets all Lambda ARNs configured for flows
 - `ListBots` (V1 and V2) - Gets all Lex bot associations
 
+### Cross-Region Lambda/Lex Copy (NEW in v3.2)
+Optionally copy Lambda functions and Lex bots to the target region:
+- `--copy-lambda` - Downloads function code and creates in target region
+- `--copy-lex` - Exports Lex V2 bot definition and imports to target region
+
+**Note:** IAM roles referenced by Lambda/Lex must exist in the target account.
+
 ### Cross-Region ARN Replacement
 When replicating across regions, automatically rewrites ARNs in flow content:
 ```
 arn:aws:lambda:us-east-1:123456789012:function:MyFunc
                 ↓
 arn:aws:lambda:us-west-2:123456789012:function:MyFunc
+```
+
+### Prompt ARN Mapping
+Maps prompts by name between source and target instances:
+```
+arn:aws:connect:us-east-1:123456:instance/SRC-ID/prompt/abc123
+                        ↓
+arn:aws:connect:us-west-2:123456:instance/TGT-ID/prompt/xyz789
 ```
 
 ### Auto-Association
@@ -161,10 +178,12 @@ python3 tools/connect-instance-replicator/connect_instance_replicate.py replicat
 | `--target-instance-id` | Target instance ID (alternative to alias) |
 | `--overwrite` | Update existing resources in target |
 | `--dry-run` | Preview without making changes |
-| `--skip-unsupported` | Skip flows with external dependencies (Lambda, Lex) |
+| `--skip-unsupported` | Skip flows with external dependencies that can't be resolved |
 | `--continue-on-error` | Continue after individual resource errors |
 | `--yes` | Confirm live changes (required for non-dry-run) |
 | `--prompt-s3-bucket` | S3 bucket for copying prompt audio files |
+| `--copy-lambda` | **NEW** Copy Lambda functions from source to target region |
+| `--copy-lex` | **NEW** Copy Lex V2 bots from source to target region |
 | `--output` | Output file path for export command |
 | `--bundle` | Bundle file path for import command |
 
@@ -188,7 +207,7 @@ npm run dev
 
 **UI Features:**
 - Region and instance selection dropdowns
-- Visual resource selector grid (17 resource types)
+- Visual resource selector grid (19 resource types)
 - Select All / Select None buttons
 - Bundle preview with resource counts
 - Dry-run mode toggle
