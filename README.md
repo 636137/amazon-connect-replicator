@@ -1,21 +1,18 @@
-# Amazon Connect Replicator (Global Resiliency)
+# Amazon Connect Replicator (Primitive APIs)
 
-This repo contains **only** what we built in this session:
-- A small **Python CLI** for Amazon Connect Global Resiliency replication (Connect `ReplicateInstance`).
-- A minimal **API + React UI** to list regions/instances, download a JSON “snapshot”, and trigger replication.
+This repo implements a **best-effort** way to copy selected Amazon Connect resources between two *existing* instances using the primitive Connect APIs (List*/Describe*/Create*/Update*).
 
-## What this does (fast path)
-Amazon Connect Global Resiliency provides **native cross-region instance replication** via `ReplicateInstance` (for supported region pairs). This is the fastest way to stand up a replica in minutes.
+What’s in the repo:
+- **Python CLI** (boto3) to export/import bundles.
+- **API + React UI** to pick regions/instances, export a bundle JSON, and import it into a target instance.
 
-Key constraints from AWS docs:
-- Only specific region pairs are supported (includes **us-east-1 ↔ us-west-2**).
-- The feature can be **access-gated** (you may see errors like “AWS account not allowlisted”).
-- Source instance must be **ACTIVE** and have **SAML** identity management.
-- External integrations (Lambda/Lex/3rd-party) are not automatically made redundant.
+## Important reality check
+Amazon Connect does **not** expose an API to fully “clone an instance” (telephony setup, identity, storage configs, etc.) into a brand new instance in minutes.
+This project instead focuses on migrating configuration objects that *do* have CRUD-style APIs.
 
-## Prereqs
-- AWS credentials available to the API server and/or Python CLI (env vars, SSO, or profiles).
-- Node.js 20+ (for UI/API) and Python 3.9+ (for CLI).
+## Current scope (bundle v1)
+- Contact Flow Modules (DescribeContactFlowModule includes JSON `Content`)
+- Contact Flows (DescribeContactFlow includes JSON `Content`)
 
 ## Run the UI + API
 ```bash
@@ -28,16 +25,12 @@ npm run dev
 ## Python CLI
 See: `tools/connect-instance-replicator/README.md`
 
-## AWS CLI equivalent
-```bash
-aws connect replicate-instance \
-  --region us-east-1 \
-  --instance-id <SOURCE_INSTANCE_ID> \
-  --replica-region us-west-2 \
-  --replica-alias <UNIQUE_REPLICA_ALIAS> \
-  --no-cli-pager
-```
+## Notes / limitations
+- Flow JSON often references other resources by **ID/ARN** (queues, prompts, routing profiles, other flows/modules). This repo does a small amount of ID/ARN rewriting for flows/modules, but it’s still best-effort.
+- Prompts, queues, routing profiles, hours, quick connects, phone numbers, etc. are not copied yet.
 
 References:
-- API `ReplicateInstance`: https://docs.aws.amazon.com/connect/latest/APIReference/API_ReplicateInstance.html
-- CLI `replicate-instance`: https://docs.aws.amazon.com/cli/latest/reference/connect/replicate-instance.html
+- Admin guide (flow import/export): https://docs.aws.amazon.com/connect/latest/adminguide/contact-flow-import-export.html
+- API `DescribeContactFlow`: https://docs.aws.amazon.com/connect/latest/APIReference/API_DescribeContactFlow.html
+- API `CreateContactFlow`: https://docs.aws.amazon.com/connect/latest/APIReference/API_CreateContactFlow.html
+- API `UpdateContactFlowContent`: https://docs.aws.amazon.com/connect/latest/APIReference/API_UpdateContactFlowContent.html

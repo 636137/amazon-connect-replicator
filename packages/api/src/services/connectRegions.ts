@@ -17,16 +17,3 @@ export const CONNECT_REGIONS: ConnectRegion[] = [
   { code: "ap-northeast-3", label: "Asia Pacific (Osaka)" }
 ];
 
-// Global Resiliency replication only supports specific pairs.
-export const GR_REPLICATION_PAIRS: Record<string, string[]> = {
-  "us-east-1": ["us-west-2"],
-  "us-west-2": ["us-east-1"],
-  "eu-central-1": ["eu-west-2"],
-  "eu-west-2": ["eu-central-1"],
-  "ap-northeast-1": ["ap-northeast-3"],
-  "ap-northeast-3": ["ap-northeast-1"]
-};
-
-export function isAllowedReplicationPair(sourceRegion: string, replicaRegion: string): boolean {
-  return (GR_REPLICATION_PAIRS[sourceRegion] || []).includes(replicaRegion);
-}

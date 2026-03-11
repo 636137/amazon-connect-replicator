@@ -3,20 +3,21 @@ import {
   ArrowRight,
   CheckCircle2,
   CloudDownload,
+  FileJson2,
   Loader2,
   RadioTower,
   RefreshCw,
   ShieldAlert,
-  Zap
+  Upload
 } from "lucide-react";
 
-import type { ConnectRegion, DescribeInstance, InstanceSummary } from "../types/connect";
+import type { ConnectRegion, DescribeInstance, ExportBundleV1, InstanceSummary } from "../types/connect";
 import {
   describeInstance,
+  exportBundle,
   getRegions,
+  importBundle,
   listInstances,
-  replicate,
-  replicationStatus,
   snapshot
 } from "../services/api";
 
@@ -39,40 +40,51 @@ function downloadJson(filename: string, obj: unknown) {
   URL.revokeObjectURL(url);
 }
 
+async function readJsonFile(file: File): Promise<any> {
+  const text = await file.text();
+  return JSON.parse(text);
+}
+
 export default function ConnectReplicatorPage() {
   const [regions, setRegions] = useState<ConnectRegion[]>([]);
-  const [sourceRegion, setSourceRegion] = useState<string>("us-east-1");
-  const [instances, setInstances] = useState<InstanceSummary[]>([]);
-  const [selectedId, setSelectedId] = useState<string>("");
-  const [selected, setSelected] = useState<DescribeInstance | undefined>(undefined);
 
-  const [replicaRegion, setReplicaRegion] = useState<string>("us-west-2");
-  const [replicaAlias, setReplicaAlias] = useState<string>("");
+  const [sourceRegion, setSourceRegion] = useState<string>("us-east-1");
+  const [sourceInstances, setSourceInstances] = useState<InstanceSummary[]>([]);
+  const [sourceId, setSourceId] = useState<string>("");
+  const [source, setSource] = useState<DescribeInstance | undefined>(undefined);
+
+  const [targetRegion, setTargetRegion] = useState<string>("us-west-2");
+  const [targetInstances, setTargetInstances] = useState<InstanceSummary[]>([]);
+  const [targetId, setTargetId] = useState<string>("");
+  const [target, setTarget] = useState<DescribeInstance | undefined>(undefined);
+
+  const [bundle, setBundle] = useState<ExportBundleV1 | null>(null);
+  const [bundleName, setBundleName] = useState<string>("");
+  const [overwrite, setOverwrite] = useState<boolean>(false);
 
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [log, setLog] = useState<string[]>([]);
 
-  const pollRef = useRef<number | null>(null);
+  const fileRef = useRef<HTMLInputElement | null>(null);
 
-  const sourceOk = selected?.InstanceStatus === "ACTIVE" && selected?.IdentityManagementType === "SAML";
+  const sourceOk = source?.InstanceStatus === "ACTIVE";
+  const targetOk = target?.InstanceStatus === "ACTIVE";
 
-  const selectedName = selected?.InstanceAlias || selectedId || "";
+  const exportFilename = useMemo(() => {
+    const safe = (source?.InstanceAlias || sourceId || "connect-instance").replace(/[^a-zA-Z0-9-_]+/g, "-");
+    return `${safe}-${sourceRegion}.connect-export.v1.json`;
+  }, [source?.InstanceAlias, sourceId, sourceRegion]);
 
-  const replicaFilename = useMemo(() => {
-    const safe = (selectedName || "connect-instance").replace(/[^a-zA-Z0-9-_]+/g, "-");
-    return `${safe}-${sourceRegion}.snapshot.json`;
-  }, [selectedName, sourceRegion]);
-
-  async function refreshInstances() {
+  async function refreshSourceInstances() {
     setError(null);
-    setBusy("Loading instances...");
+    setBusy("Loading source instances...");
     try {
       const list = await listInstances(sourceRegion);
-      setInstances(list);
-      if (!list.find((i) => i.Id === selectedId)) {
-        setSelectedId("");
-        setSelected(undefined);
+      setSourceInstances(list);
+      if (!list.find((i) => i.Id === sourceId)) {
+        setSourceId("");
+        setSource(undefined);
       }
     } catch (e: any) {
       setError(e?.message || String(e));
@@ -81,13 +93,42 @@ export default function ConnectReplicatorPage() {
     }
   }
 
-  async function refreshSelected() {
-    if (!selectedId) return;
+  async function refreshTargetInstances() {
     setError(null);
-    setBusy("Loading instance details...");
+    setBusy("Loading target instances...");
     try {
-      const inst = await describeInstance(sourceRegion, selectedId);
-      setSelected(inst);
+      const list = await listInstances(targetRegion);
+      setTargetInstances(list);
+      if (!list.find((i) => i.Id === targetId)) {
+        setTargetId("");
+        setTarget(undefined);
+      }
+    } catch (e: any) {
+      setError(e?.message || String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function refreshSourceDetails() {
+    if (!sourceId) return;
+    setError(null);
+    setBusy("Loading source instance details...");
+    try {
+      setSource(await describeInstance(sourceRegion, sourceId));
+    } catch (e: any) {
+      setError(e?.message || String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function refreshTargetDetails() {
+    if (!targetId) return;
+    setError(null);
+    setBusy("Loading target instance details...");
+    try {
+      setTarget(await describeInstance(targetRegion, targetId));
     } catch (e: any) {
       setError(e?.message || String(e));
     } finally {
@@ -102,29 +143,35 @@ export default function ConnectReplicatorPage() {
   }, []);
 
   useEffect(() => {
-    refreshInstances();
+    refreshSourceInstances();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sourceRegion]);
 
   useEffect(() => {
-    refreshSelected();
+    refreshTargetInstances();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedId]);
+  }, [targetRegion]);
 
   useEffect(() => {
-    return () => {
-      if (pollRef.current) window.clearInterval(pollRef.current);
-    };
-  }, []);
+    refreshSourceDetails();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sourceId]);
 
-  async function doSnapshot() {
-    if (!selectedId) return;
+  useEffect(() => {
+    refreshTargetDetails();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targetId]);
+
+  async function doExport() {
+    if (!sourceId) return;
     setError(null);
-    setBusy("Capturing snapshot...");
+    setBusy("Exporting contact flows + modules...");
     try {
-      const snap = await snapshot(sourceRegion, selectedId);
-      downloadJson(replicaFilename, snap);
-      setLog((l) => [`Snapshot downloaded: ${replicaFilename}`, ...l]);
+      const b = await exportBundle(sourceRegion, sourceId);
+      setBundle(b);
+      setBundleName(exportFilename);
+      downloadJson(exportFilename, b);
+      setLog((l) => [`Exported bundle: modules=${b.flowModules.length}, flows=${b.contactFlows.length}`, ...l]);
     } catch (e: any) {
       setError(e?.message || String(e));
     } finally {
@@ -132,47 +179,40 @@ export default function ConnectReplicatorPage() {
     }
   }
 
-  async function doReplicate() {
-    if (!selectedId) return;
-    if (!replicaAlias.trim()) {
-      setError("Replica alias is required.");
+  async function doImport() {
+    if (!targetId) return;
+    if (!bundle) {
+      setError("No bundle loaded. Export one or choose a JSON bundle file.");
       return;
     }
 
     setError(null);
-    setBusy("Starting replication...");
-    setLog((l) => [`ReplicateInstance: ${sourceRegion} -> ${replicaRegion}`, ...l]);
-
+    setBusy("Importing bundle into target instance...");
     try {
-      await replicate({
-        sourceRegion,
-        instanceId: selectedId,
-        replicaRegion,
-        replicaAlias: replicaAlias.trim()
+      const out = await importBundle({
+        region: targetRegion,
+        instanceId: targetId,
+        bundle,
+        overwrite
       });
-
-      setLog((l) => [`Replication request accepted. Polling target region...`, ...l]);
-
-      if (pollRef.current) window.clearInterval(pollRef.current);
-      pollRef.current = window.setInterval(async () => {
-        try {
-          const out = await replicationStatus(replicaRegion, selectedId);
-          const st = out.status || "UNKNOWN";
-          setLog((l) => [`Replica status (${replicaRegion}): ${st}`, ...l].slice(0, 50));
-          if (st === "ACTIVE") {
-            window.clearInterval(pollRef.current!);
-            pollRef.current = null;
-            setBusy(null);
-          }
-        } catch (e: any) {
-          setError(e?.message || String(e));
-          window.clearInterval(pollRef.current!);
-          pollRef.current = null;
-          setBusy(null);
-        }
-      }, 5000);
+      setLog((l) => [`Import finished: ${JSON.stringify(out)}`, ...l]);
     } catch (e: any) {
       setError(e?.message || String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function doInstanceSnapshot(region: string, instanceId: string, filename: string) {
+    setError(null);
+    setBusy("Capturing instance snapshot...");
+    try {
+      const snap = await snapshot(region, instanceId);
+      downloadJson(filename, snap);
+      setLog((l) => [`Instance snapshot downloaded: ${filename}`, ...l]);
+    } catch (e: any) {
+      setError(e?.message || String(e));
+    } finally {
       setBusy(null);
     }
   }
@@ -184,18 +224,21 @@ export default function ConnectReplicatorPage() {
           <div>
             <div className="inline-flex items-center gap-2 rounded-full bg-white/10 px-3 py-1 text-xs text-white/80 ring-1 ring-white/10">
               <RadioTower className="h-4 w-4" />
-              Global Resiliency • ReplicateInstance
+              Primitive Connect APIs • Export/Import
             </div>
             <h1 className="mt-4 text-3xl font-bold tracking-tight">Amazon Connect Replicator</h1>
             <p className="mt-2 max-w-2xl text-sm text-white/70">
-              Pick a source instance, download a JSON snapshot, and trigger cross-region replication.
-              AWS credentials are used server-side only.
+              Best-effort migration using Connect List/Describe/Create/Update APIs. This does not create a new instance;
+              it copies resources between existing instances.
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
             <button
-              onClick={refreshInstances}
+              onClick={() => {
+                refreshSourceInstances();
+                refreshTargetInstances();
+              }}
               className="inline-flex items-center gap-2 rounded-xl bg-white/10 px-4 py-2 text-sm ring-1 ring-white/10 transition hover:bg-white/15"
             >
               <RefreshCw className="h-4 w-4" />
@@ -209,8 +252,8 @@ export default function ConnectReplicatorPage() {
             <div className="rounded-2xl bg-white/5 p-5 ring-1 ring-white/10">
               <div className="flex items-center justify-between">
                 <h2 className="text-lg font-semibold">Source</h2>
-                <div className={`rounded-full px-3 py-1 text-xs ${pillTone(selected?.InstanceStatus)}`}>
-                  {selected?.InstanceStatus || "—"}
+                <div className={`rounded-full px-3 py-1 text-xs ${pillTone(source?.InstanceStatus)}`}>
+                  {source?.InstanceStatus || "—"}
                 </div>
               </div>
 
@@ -230,72 +273,60 @@ export default function ConnectReplicatorPage() {
               </div>
 
               <div className="mt-4">
-                <label className="text-xs text-white/70">Instances</label>
-                <div className="mt-2 max-h-[360px] overflow-auto rounded-xl ring-1 ring-white/10">
-                  {instances.length === 0 ? (
-                    <div className="p-4 text-sm text-white/60">No instances found in this region.</div>
-                  ) : (
-                    <ul className="divide-y divide-white/10">
-                      {instances.map((i) => (
-                        <li key={i.Id}>
-                          <button
-                            onClick={() => setSelectedId(i.Id || "")}
-                            className={`w-full px-4 py-3 text-left transition hover:bg-white/5 ${
-                              selectedId === i.Id ? "bg-white/10" : ""
-                            }`}
-                          >
-                            <div className="flex items-center justify-between gap-3">
-                              <div>
-                                <div className="text-sm font-medium">
-                                  {i.InstanceAlias || i.Id}
-                                </div>
-                                <div className="mt-1 text-xs text-white/60">{i.Arn}</div>
-                              </div>
-                              <div className={`shrink-0 rounded-full px-3 py-1 text-xs ${pillTone(i.InstanceStatus)}`}>
-                                {i.InstanceStatus || "—"}
-                              </div>
-                            </div>
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
+                <label className="text-xs text-white/70">Instance</label>
+                <select
+                  value={sourceId}
+                  onChange={(e) => setSourceId(e.target.value)}
+                  className="mt-1 w-full rounded-xl bg-black/30 px-3 py-2 text-sm ring-1 ring-white/10 outline-none focus:ring-2 focus:ring-white/20"
+                >
+                  <option value="">Select…</option>
+                  {sourceInstances.map((i) => (
+                    <option key={i.Id} value={i.Id}>
+                      {(i.InstanceAlias || i.Id) ?? ""}
+                    </option>
+                  ))}
+                </select>
               </div>
 
               <div className="mt-4 flex flex-wrap gap-2">
                 <button
-                  onClick={doSnapshot}
-                  disabled={!selectedId || !!busy}
+                  onClick={doExport}
+                  disabled={!sourceId || !!busy}
                   className="inline-flex items-center gap-2 rounded-xl bg-emerald-500/15 px-4 py-2 text-sm text-emerald-100 ring-1 ring-emerald-500/30 transition hover:bg-emerald-500/20 disabled:opacity-40"
                 >
                   <CloudDownload className="h-4 w-4" />
-                  Snapshot
+                  Export bundle
                 </button>
+
                 <button
-                  onClick={refreshSelected}
-                  disabled={!selectedId || !!busy}
+                  onClick={() => {
+                    if (!sourceId) return;
+                    const safe = (source?.InstanceAlias || sourceId || "connect-instance").replace(/[^a-zA-Z0-9-_]+/g, "-");
+                    void doInstanceSnapshot(sourceRegion, sourceId, `${safe}-${sourceRegion}.instance.json`);
+                  }}
+                  disabled={!sourceId || !!busy}
                   className="inline-flex items-center gap-2 rounded-xl bg-white/10 px-4 py-2 text-sm ring-1 ring-white/10 transition hover:bg-white/15 disabled:opacity-40"
                 >
-                  <RefreshCw className="h-4 w-4" />
-                  Details
+                  <FileJson2 className="h-4 w-4" />
+                  Instance JSON
                 </button>
               </div>
 
-              {selected && (
-                <div className="mt-4 rounded-xl bg-black/20 p-4 ring-1 ring-white/10">
-                  <div className="grid grid-cols-2 gap-3 text-xs">
+              <div className="mt-4 rounded-xl bg-black/20 p-4 text-xs text-white/70 ring-1 ring-white/10">
+                <div className="font-semibold text-white/80">What’s included (v1)</div>
+                <div className="mt-2">• Contact Flow Modules (describe + content)</div>
+                <div>• Contact Flows (describe + content)</div>
+                <div className="mt-3 text-white/60">
+                  Notes: prompts/queues/routing profiles/etc are not copied yet. Flow JSON may reference resources by ID/ARN.
+                </div>
+              </div>
+
+              {!sourceOk && source && (
+                <div className="mt-4 rounded-xl bg-amber-500/10 p-4 text-sm text-amber-100 ring-1 ring-amber-500/20">
+                  <div className="flex items-start gap-3">
+                    <ShieldAlert className="mt-0.5 h-5 w-5" />
                     <div>
-                      <div className="text-white/60">Identity</div>
-                      <div className="mt-1 font-medium">{selected.IdentityManagementType || "—"}</div>
-                    </div>
-                    <div>
-                      <div className="text-white/60">Alias</div>
-                      <div className="mt-1 font-medium">{selected.InstanceAlias || "—"}</div>
-                    </div>
-                    <div className="col-span-2">
-                      <div className="text-white/60">ARN</div>
-                      <div className="mt-1 break-all font-medium">{selected.Arn || "—"}</div>
+                      Source instance is not ACTIVE; exports can still work but you may hit API errors.
                     </div>
                   </div>
                 </div>
@@ -306,19 +337,18 @@ export default function ConnectReplicatorPage() {
           <section className="lg:col-span-7">
             <div className="rounded-2xl bg-white/5 p-5 ring-1 ring-white/10">
               <div className="flex items-center justify-between">
-                <h2 className="text-lg font-semibold">Replicate</h2>
-                <div className="inline-flex items-center gap-2 text-xs text-white/60">
-                  <Zap className="h-4 w-4" />
-                  Uses Connect ReplicateInstance
+                <h2 className="text-lg font-semibold">Target</h2>
+                <div className={`rounded-full px-3 py-1 text-xs ${pillTone(target?.InstanceStatus)}`}>
+                  {target?.InstanceStatus || "—"}
                 </div>
               </div>
 
               <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
                 <div>
-                  <label className="text-xs text-white/70">Target region</label>
+                  <label className="text-xs text-white/70">Region</label>
                   <select
-                    value={replicaRegion}
-                    onChange={(e) => setReplicaRegion(e.target.value)}
+                    value={targetRegion}
+                    onChange={(e) => setTargetRegion(e.target.value)}
                     className="mt-1 w-full rounded-xl bg-black/30 px-3 py-2 text-sm ring-1 ring-white/10 outline-none focus:ring-2 focus:ring-white/20"
                   >
                     {regions.map((r) => (
@@ -330,54 +360,120 @@ export default function ConnectReplicatorPage() {
                 </div>
 
                 <div>
-                  <label className="text-xs text-white/70">Replica alias</label>
-                  <input
-                    value={replicaAlias}
-                    onChange={(e) => setReplicaAlias(e.target.value)}
-                    placeholder="unique-replica-alias"
+                  <label className="text-xs text-white/70">Instance</label>
+                  <select
+                    value={targetId}
+                    onChange={(e) => setTargetId(e.target.value)}
                     className="mt-1 w-full rounded-xl bg-black/30 px-3 py-2 text-sm ring-1 ring-white/10 outline-none focus:ring-2 focus:ring-white/20"
-                  />
+                  >
+                    <option value="">Select…</option>
+                    {targetInstances.map((i) => (
+                      <option key={i.Id} value={i.Id}>
+                        {(i.InstanceAlias || i.Id) ?? ""}
+                      </option>
+                    ))}
+                  </select>
                 </div>
               </div>
 
               <div className="mt-4 rounded-xl bg-black/20 p-4 ring-1 ring-white/10">
-                <div className="flex items-start gap-3">
-                  {sourceOk ? (
-                    <CheckCircle2 className="mt-0.5 h-5 w-5 text-emerald-300" />
-                  ) : (
-                    <ShieldAlert className="mt-0.5 h-5 w-5 text-amber-300" />
-                  )}
+                <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
                   <div className="text-sm">
-                    <div className="font-medium">Preflight</div>
-                    <div className="mt-1 text-white/70">
-                      Source must be <span className="font-medium">ACTIVE</span> and Identity must be <span className="font-medium">SAML</span>.
+                    <div className="font-medium">Bundle</div>
+                    <div className="mt-1 text-xs text-white/60">
+                      {bundle ? (
+                        <span>
+                          Loaded <span className="font-medium text-white/80">{bundleName || "bundle"}</span> • modules={bundle.flowModules.length} • flows={bundle.contactFlows.length}
+                        </span>
+                      ) : (
+                        <span>No bundle loaded yet.</span>
+                      )}
                     </div>
-                    {selected && !sourceOk && (
-                      <div className="mt-2 text-xs text-amber-100/80">
-                        Current: status={selected.InstanceStatus || "—"}, identity={selected.IdentityManagementType || "—"}
-                      </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      ref={fileRef}
+                      type="file"
+                      accept="application/json"
+                      className="hidden"
+                      onChange={async (e) => {
+                        const f = e.target.files?.[0];
+                        if (!f) return;
+                        setError(null);
+                        setBusy("Loading bundle file...");
+                        try {
+                          const parsed = (await readJsonFile(f)) as ExportBundleV1;
+                          if (parsed?.version !== 1) throw new Error("Unsupported bundle version");
+                          setBundle(parsed);
+                          setBundleName(f.name);
+                          setLog((l) => [`Loaded bundle file: ${f.name}`, ...l]);
+                        } catch (err: any) {
+                          setError(err?.message || String(err));
+                        } finally {
+                          setBusy(null);
+                          e.target.value = "";
+                        }
+                      }}
+                    />
+
+                    <button
+                      onClick={() => fileRef.current?.click()}
+                      disabled={!!busy}
+                      className="inline-flex items-center gap-2 rounded-xl bg-white/10 px-4 py-2 text-sm ring-1 ring-white/10 transition hover:bg-white/15 disabled:opacity-40"
+                    >
+                      <Upload className="h-4 w-4" />
+                      Choose file
+                    </button>
+
+                    <button
+                      onClick={doImport}
+                      disabled={!targetId || !!busy || !bundle}
+                      className="inline-flex items-center gap-2 rounded-xl bg-cyan-500/15 px-4 py-2 text-sm text-cyan-100 ring-1 ring-cyan-500/30 transition hover:bg-cyan-500/20 disabled:opacity-40"
+                    >
+                      <ArrowRight className="h-4 w-4" />
+                      Import
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mt-3 flex items-center gap-3 text-xs text-white/70">
+                  <label className="inline-flex select-none items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={overwrite}
+                      onChange={(e) => setOverwrite(e.target.checked)}
+                      className="h-4 w-4 rounded border-white/20 bg-black/30"
+                    />
+                    Overwrite existing flows/modules (by name)
+                  </label>
+
+                  <div className="ml-auto inline-flex items-center gap-2">
+                    {targetOk ? (
+                      <>
+                        <CheckCircle2 className="h-4 w-4 text-emerald-300" />
+                        <span>Target ACTIVE</span>
+                      </>
+                    ) : (
+                      <>
+                        <ShieldAlert className="h-4 w-4 text-amber-300" />
+                        <span>Target not ACTIVE</span>
+                      </>
                     )}
                   </div>
                 </div>
+
+                <div className="mt-3 text-xs text-white/60">
+                  Import is best-effort: flow JSON may still reference prompts/queues/routing profiles not present in the target.
+                </div>
               </div>
 
-              <div className="mt-4 flex flex-wrap items-center gap-2">
-                <button
-                  onClick={doReplicate}
-                  disabled={!selectedId || !!busy}
-                  className="inline-flex items-center gap-2 rounded-xl bg-cyan-500/15 px-4 py-2 text-sm text-cyan-100 ring-1 ring-cyan-500/30 transition hover:bg-cyan-500/20 disabled:opacity-40"
-                >
-                  <ArrowRight className="h-4 w-4" />
-                  Replicate
-                </button>
-
-                {busy && (
-                  <div className="inline-flex items-center gap-2 text-sm text-white/70">
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    {busy}
-                  </div>
-                )}
-              </div>
+              {busy && (
+                <div className="mt-4 inline-flex items-center gap-2 text-sm text-white/70">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  {busy}
+                </div>
+              )}
 
               {error && (
                 <div className="mt-4 rounded-xl bg-rose-500/10 p-4 text-sm text-rose-100 ring-1 ring-rose-500/20">

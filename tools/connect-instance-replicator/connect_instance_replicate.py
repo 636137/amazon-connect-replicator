@@ -1,12 +1,26 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import sys
-import time
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import boto3
-from botocore.exceptions import BotoCoreError, ClientError
+from botocore.exceptions import ClientError
+
+
+CONTACT_FLOW_TYPES: List[str] = [
+    "CONTACT_FLOW",
+    "CUSTOMER_QUEUE",
+    "CUSTOMER_HOLD",
+    "CUSTOMER_WHISPER",
+    "AGENT_HOLD",
+    "AGENT_WHISPER",
+    "OUTBOUND_WHISPER",
+    "AGENT_TRANSFER",
+    "QUEUE_TRANSFER",
+    "CAMPAIGN",
+]
 
 
 def _session(profile: Optional[str], region: str) -> boto3.session.Session:
@@ -19,211 +33,295 @@ def _connect_client(profile: Optional[str], region: str):
     return _session(profile, region).client("connect")
 
 
-def _describe_instance_status(connect_client, instance_id: str) -> Tuple[Optional[str], Optional[Dict]]:
-    try:
-        resp = connect_client.describe_instance(InstanceId=instance_id)
-        inst = resp.get("Instance")
-        if not inst:
-            return None, resp
-        return inst.get("InstanceStatus"), inst
-    except connect_client.exceptions.ResourceNotFoundException:
-        return None, None
-
-
-def wait_for_instance_active(
-    *,
-    profile: Optional[str],
-    region: str,
-    instance_id: str,
-    timeout_seconds: int,
-    poll_seconds: int,
-) -> Dict:
-    deadline = time.time() + timeout_seconds
-    client = _connect_client(profile, region)
-
-    last_status = None
-    while time.time() < deadline:
-        status, inst = _describe_instance_status(client, instance_id)
-        if status:
-            last_status = status
-
-        if status == "ACTIVE":
-            return inst
-
-        # Known terminal-ish failures for related resources. (Exact values can evolve; keep conservative.)
-        if status in {"CREATION_FAILED", "FAILED"}:
-            raise RuntimeError(f"Replica instance entered failure state: {status}")
-
-        time.sleep(poll_seconds)
-
-    raise TimeoutError(
-        f"Timed out waiting for instance {instance_id} to become ACTIVE in {region}. Last status: {last_status}"
-    )
-
-
-def replicate_instance(
-    *,
-    profile: Optional[str],
-    source_region: str,
-    target_region: str,
-    instance_id: str,
-    replica_alias: str,
-    client_token: Optional[str],
-) -> Dict:
-    client = _connect_client(profile, source_region)
-
-    kwargs = {
-        "InstanceId": instance_id,
-        "ReplicaRegion": target_region,
-        "ReplicaAlias": replica_alias,
-    }
-    if client_token:
-        kwargs["ClientToken"] = client_token
-
-    return client.replicate_instance(**kwargs)
-
-
-def _get_default_tdg_id(*, profile: Optional[str], region: str, instance_id: str) -> str:
-    client = _connect_client(profile, region)
-    next_token = None
-
+def _paginate(method, *, next_token_key: str = "NextToken", **kwargs) -> Iterable[Dict[str, Any]]:
+    token = None
     while True:
-        kwargs = {"InstanceId": instance_id, "MaxResults": 10}
-        if next_token:
-            kwargs["NextToken"] = next_token
-        resp = client.list_traffic_distribution_groups(**kwargs)
-        for tdg in resp.get("TrafficDistributionGroupSummaryList", []) or []:
-            if tdg.get("IsDefault"):
-                # Boto3 docs: if calling from replicated region, you must use ARN. Here we call from TDG's home region.
-                return tdg.get("Id") or tdg.get("Arn")
-
-        next_token = resp.get("NextToken")
-        if not next_token:
-            break
-
-    raise RuntimeError("No default traffic distribution group found for instance; is replication enabled?")
-
-
-def _iter_user_ids(*, profile: Optional[str], region: str, instance_id: str) -> Iterable[str]:
-    client = _connect_client(profile, region)
-    next_token = None
-
-    while True:
-        kwargs = {"InstanceId": instance_id, "MaxResults": 100}
-        if next_token:
-            kwargs["NextToken"] = next_token
-        resp = client.list_users(**kwargs)
-        for user in resp.get("UserSummaryList", []) or []:
-            uid = user.get("Id") or user.get("Arn")
-            if uid:
-                yield uid
-
-        next_token = resp.get("NextToken")
-        if not next_token:
+        call_kwargs = dict(kwargs)
+        if token:
+            call_kwargs[next_token_key] = token
+        resp = method(**call_kwargs)
+        yield resp
+        token = resp.get(next_token_key)
+        if not token:
             break
 
 
-def associate_users_to_default_tdg(
-    *,
-    profile: Optional[str],
-    region: str,
-    instance_id: str,
-    user_ids: Optional[List[str]],
-    all_users: bool,
-) -> int:
-    if bool(user_ids) == bool(all_users):
-        raise ValueError("Specify exactly one of --user-id or --all-users")
-
-    tdg_id = _get_default_tdg_id(profile=profile, region=region, instance_id=instance_id)
-    client = _connect_client(profile, region)
-
-    if all_users:
-        to_assoc = list(_iter_user_ids(profile=profile, region=region, instance_id=instance_id))
-    else:
-        to_assoc = user_ids or []
-
-    failures = 0
-    for uid in to_assoc:
-        try:
-            client.associate_traffic_distribution_group_user(
-                TrafficDistributionGroupId=tdg_id,
-                InstanceId=instance_id,
-                UserId=uid,
-            )
-        except client.exceptions.ResourceConflictException:
-            # Already associated.
+def _apply_replacements(content: str, replacements: List[Tuple[str, str]]) -> str:
+    out = content
+    for src, dst in replacements:
+        if not src or src == dst:
             continue
-        except ClientError as e:
-            failures += 1
-            print(f"Failed to associate user {uid}: {e}", file=sys.stderr)
-
-    return failures
+        out = out.replace(src, dst)
+    return out
 
 
-def _preflight_source_instance(*, profile: Optional[str], source_region: str, instance_id: str) -> None:
-    client = _connect_client(profile, source_region)
-    resp = client.describe_instance(InstanceId=instance_id)
-    inst = resp.get("Instance") or {}
+def export_bundle(*, profile: Optional[str], region: str, instance_id: str) -> Dict[str, Any]:
+    client = _connect_client(profile, region)
 
-    status = inst.get("InstanceStatus")
-    if status != "ACTIVE":
-        raise RuntimeError(f"Source instance must be ACTIVE to replicate. Current status: {status}")
+    # Modules
+    modules: List[Dict[str, Any]] = []
+    for page in _paginate(client.list_contact_flow_modules, InstanceId=instance_id, MaxResults=100):
+        modules.extend(page.get("ContactFlowModulesSummaryList") or [])
 
-    # AWS docs note replication requires SAML enabled.
-    idm = inst.get("IdentityManagementType")
-    if idm != "SAML":
-        raise RuntimeError(
-            f"Replication requires IdentityManagementType=SAML (SAML enabled). Current: {idm}"
+    flow_modules: List[Dict[str, Any]] = []
+    for m in modules:
+        mid = m.get("Id")
+        if not mid:
+            continue
+        d = client.describe_contact_flow_module(InstanceId=instance_id, ContactFlowModuleId=mid)
+        mod = d.get("ContactFlowModule") or {}
+        if mod.get("Name"):
+            flow_modules.append(
+                {
+                    "id": mod.get("Id"),
+                    "arn": mod.get("Arn"),
+                    "name": mod.get("Name"),
+                    "description": mod.get("Description"),
+                    "state": mod.get("State"),
+                    "status": mod.get("Status"),
+                    "content": mod.get("Content"),
+                    "settings": mod.get("Settings"),
+                    "tags": mod.get("Tags"),
+                }
+            )
+
+    # Flows
+    flows: List[Dict[str, Any]] = []
+    for page in _paginate(
+        client.list_contact_flows,
+        InstanceId=instance_id,
+        ContactFlowTypes=CONTACT_FLOW_TYPES,
+        MaxResults=100,
+    ):
+        flows.extend(page.get("ContactFlowSummaryList") or [])
+
+    contact_flows: List[Dict[str, Any]] = []
+    for f in flows:
+        fid = f.get("Id")
+        if not fid:
+            continue
+        d = client.describe_contact_flow(InstanceId=instance_id, ContactFlowId=fid)
+        flow = d.get("ContactFlow") or {}
+        if flow.get("Name") and flow.get("Type"):
+            contact_flows.append(
+                {
+                    "id": flow.get("Id"),
+                    "arn": flow.get("Arn"),
+                    "name": flow.get("Name"),
+                    "type": flow.get("Type"),
+                    "description": flow.get("Description"),
+                    "state": flow.get("State"),
+                    "status": flow.get("Status"),
+                    "content": flow.get("Content"),
+                    "tags": flow.get("Tags"),
+                }
+            )
+
+    return {
+        "version": 1,
+        "exportedAt": __import__("datetime").datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        "source": {"region": region, "instanceId": instance_id},
+        "flowModules": flow_modules,
+        "contactFlows": contact_flows,
+    }
+
+
+def import_bundle(
+    *,
+    profile: Optional[str],
+    region: str,
+    instance_id: str,
+    bundle: Dict[str, Any],
+    overwrite: bool,
+    dry_run: bool,
+) -> Dict[str, Any]:
+    if bundle.get("version") != 1:
+        raise ValueError("Unsupported bundle version")
+
+    client = _connect_client(profile, region)
+
+    # Existing modules
+    existing_modules: Dict[str, Dict[str, Any]] = {}
+    for page in _paginate(client.list_contact_flow_modules, InstanceId=instance_id, MaxResults=100):
+        for m in page.get("ContactFlowModulesSummaryList") or []:
+            if m.get("Name"):
+                existing_modules[m["Name"]] = m
+
+    module_repl: List[Tuple[str, str]] = []
+
+    created_modules = updated_modules = skipped_modules = 0
+
+    for m in bundle.get("flowModules") or []:
+        name = m.get("name")
+        if not name:
+            continue
+        existing = existing_modules.get(name)
+
+        if existing and existing.get("Id"):
+            if not overwrite:
+                skipped_modules += 1
+            else:
+                if not dry_run:
+                    client.update_contact_flow_module_content(
+                        InstanceId=instance_id,
+                        ContactFlowModuleId=existing["Id"],
+                        Content=m.get("content") or "{}",
+                        Settings=m.get("settings"),
+                    )
+                updated_modules += 1
+
+            if m.get("id"):
+                module_repl.append((m["id"], existing["Id"]))
+            if m.get("arn") and existing.get("Arn"):
+                module_repl.append((m["arn"], existing["Arn"]))
+            continue
+
+        if dry_run:
+            created_modules += 1
+            continue
+
+        resp = client.create_contact_flow_module(
+            InstanceId=instance_id,
+            Name=name,
+            Description=m.get("description"),
+            Content=m.get("content") or "{}",
+            Tags=m.get("tags"),
+            Settings=m.get("settings"),
         )
+        created_modules += 1
 
-    alias = inst.get("InstanceAlias")
-    if not alias:
-        raise RuntimeError("Source instance must have an InstanceAlias to replicate.")
+        existing_modules[name] = {"Id": resp.get("Id"), "Arn": resp.get("Arn"), "Name": name}
+        if m.get("id") and resp.get("Id"):
+            module_repl.append((m["id"], resp["Id"]))
+        if m.get("arn") and resp.get("Arn"):
+            module_repl.append((m["arn"], resp["Arn"]))
+
+    # Existing flows
+    existing_flows: Dict[str, Dict[str, Any]] = {}
+    for page in _paginate(
+        client.list_contact_flows,
+        InstanceId=instance_id,
+        ContactFlowTypes=CONTACT_FLOW_TYPES,
+        MaxResults=100,
+    ):
+        for f in page.get("ContactFlowSummaryList") or []:
+            if f.get("Name") and f.get("ContactFlowType"):
+                existing_flows[f"{f['ContactFlowType']}|{f['Name']}"] = f
+
+    flow_repl: List[Tuple[str, str]] = []
+    created_flows = updated_flows = skipped_flows = 0
+
+    imported_targets: List[Tuple[Dict[str, Any], str]] = []
+
+    for f in bundle.get("contactFlows") or []:
+        name = f.get("name")
+        ftype = f.get("type")
+        if not name or not ftype:
+            continue
+
+        key = f"{ftype}|{name}"
+        existing = existing_flows.get(key)
+
+        raw_content = f.get("content") or "{}"
+        content1 = _apply_replacements(str(raw_content), module_repl)
+
+        if existing and existing.get("Id"):
+            if not overwrite:
+                skipped_flows += 1
+            else:
+                if not dry_run:
+                    client.update_contact_flow_content(
+                        InstanceId=instance_id,
+                        ContactFlowId=existing["Id"],
+                        Content=content1,
+                    )
+                updated_flows += 1
+
+            if f.get("id"):
+                flow_repl.append((f["id"], existing["Id"]))
+            if f.get("arn") and existing.get("Arn"):
+                flow_repl.append((f["arn"], existing["Arn"]))
+
+            imported_targets.append((f, existing["Id"]))
+            continue
+
+        if dry_run:
+            created_flows += 1
+            continue
+
+        try:
+            resp = client.create_contact_flow(
+                InstanceId=instance_id,
+                Name=name,
+                Type=ftype,
+                Description=f.get("description"),
+                Content=content1,
+                Tags=f.get("tags"),
+            )
+        except ClientError as e:
+            raise RuntimeError(f"Failed creating contact flow '{name}' ({ftype}): {e}")
+
+        created_flows += 1
+
+        if f.get("id") and resp.get("ContactFlowId"):
+            flow_repl.append((f["id"], resp["ContactFlowId"]))
+        if f.get("arn") and resp.get("ContactFlowArn"):
+            flow_repl.append((f["arn"], resp["ContactFlowArn"]))
+
+        if resp.get("ContactFlowId"):
+            imported_targets.append((f, resp["ContactFlowId"]))
+
+        existing_flows[key] = {
+            "Id": resp.get("ContactFlowId"),
+            "Arn": resp.get("ContactFlowArn"),
+            "Name": name,
+            "ContactFlowType": ftype,
+        }
+
+    # Second pass: rewrite flow-to-flow references (best-effort)
+    if not dry_run and overwrite:
+        for src_flow, target_id in imported_targets:
+            raw_content = src_flow.get("content")
+            if not isinstance(raw_content, str):
+                continue
+            content2 = _apply_replacements(_apply_replacements(raw_content, module_repl), flow_repl)
+            client.update_contact_flow_content(
+                InstanceId=instance_id,
+                ContactFlowId=target_id,
+                Content=content2,
+            )
+
+    return {
+        "createdModules": created_modules,
+        "updatedModules": updated_modules,
+        "skippedModules": skipped_modules,
+        "createdFlows": created_flows,
+        "updatedFlows": updated_flows,
+        "skippedFlows": skipped_flows,
+        "dryRun": dry_run,
+        "overwrite": overwrite,
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Replicate an Amazon Connect instance cross-region using ReplicateInstance (Global Resiliency)."
+        description="Best-effort Amazon Connect exporter/importer using primitive Connect APIs (flows + modules)."
     )
     p.add_argument("--profile", default=None, help="AWS credential profile name (optional)")
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    rep = sub.add_parser("replicate", help="Create a replica instance in a paired region")
-    rep.add_argument("--source-region", required=True, help="Region of the source instance (e.g., us-east-1)")
-    rep.add_argument("--target-region", required=True, help="Region of the replica (e.g., us-west-2)")
-    rep.add_argument("--instance-id", required=True, help="Source instance ID (or full instance ARN)")
-    rep.add_argument(
-        "--replica-alias",
-        required=True,
-        help="Unique alias for the replicated instance in the target region",
-    )
-    rep.add_argument("--client-token", default=None, help="Idempotency token (optional)")
-    rep.add_argument("--wait", action="store_true", help="Wait until the replica is ACTIVE")
-    rep.add_argument("--timeout-seconds", type=int, default=1800, help="Wait timeout (default 1800)")
-    rep.add_argument("--poll-seconds", type=int, default=10, help="Polling interval (default 10)")
+    exp = sub.add_parser("export", help="Export a bundle (flows + flow modules)")
+    exp.add_argument("--region", required=True)
+    exp.add_argument("--instance-id", required=True)
+    exp.add_argument("--out", required=False, default="-", help="Output file path, or '-' for stdout")
 
-    assoc = sub.add_parser(
-        "associate-users",
-        help="Associate user(s) to the default traffic distribution group (post-replication step)",
-    )
-    assoc.add_argument(
-        "--region",
-        required=True,
-        help="Region where the traffic distribution group exists (typically the source region)",
-    )
-    assoc.add_argument("--instance-id", required=True, help="Instance ID shared by source/replica")
-    assoc.add_argument(
-        "--user-id",
-        action="append",
-        default=None,
-        help="User ID/ARN to associate (repeatable). Mutually exclusive with --all-users",
-    )
-    assoc.add_argument(
-        "--all-users",
-        action="store_true",
-        help="Associate all users in the instance (uses ListUsers)",
-    )
+    imp = sub.add_parser("import", help="Import a bundle into an existing instance")
+    imp.add_argument("--region", required=True)
+    imp.add_argument("--instance-id", required=True)
+    imp.add_argument("--in", dest="in_path", required=True, help="Input bundle JSON path")
+    imp.add_argument("--overwrite", action="store_true", help="Overwrite (update content) if resource exists")
+    imp.add_argument("--dry-run", action="store_true", help="Print what would happen, but do not call Create/Update")
 
     return p
 
@@ -232,62 +330,36 @@ def main(argv: List[str]) -> int:
     args = build_parser().parse_args(argv)
 
     try:
-        if args.cmd == "replicate":
-            _preflight_source_instance(
-                profile=args.profile, source_region=args.source_region, instance_id=args.instance_id
-            )
-
-            resp = replicate_instance(
-                profile=args.profile,
-                source_region=args.source_region,
-                target_region=args.target_region,
-                instance_id=args.instance_id,
-                replica_alias=args.replica_alias,
-                client_token=args.client_token,
-            )
-
-            # Per AWS docs: replica has same instance ID as source.
-            replica_id = resp.get("Id")
-            replica_arn = resp.get("Arn")
-            print(f"replicate_instance started. replica_id={replica_id} replica_arn={replica_arn}")
-
-            if args.wait:
-                inst = wait_for_instance_active(
-                    profile=args.profile,
-                    region=args.target_region,
-                    instance_id=replica_id or args.instance_id,
-                    timeout_seconds=args.timeout_seconds,
-                    poll_seconds=args.poll_seconds,
-                )
-                print(
-                    "replica ACTIVE: "
-                    + f"id={inst.get('Id')} arn={inst.get('Arn')} alias={inst.get('InstanceAlias')}"
-                )
-
+        if args.cmd == "export":
+            b = export_bundle(profile=args.profile, region=args.region, instance_id=args.instance_id)
+            data = json.dumps(b, indent=2)
+            if args.out == "-":
+                print(data)
+            else:
+                with open(args.out, "w", encoding="utf-8") as f:
+                    f.write(data)
+                print(f"Wrote bundle: {args.out}")
             return 0
 
-        if args.cmd == "associate-users":
-            failures = associate_users_to_default_tdg(
+        if args.cmd == "import":
+            with open(args.in_path, "r", encoding="utf-8") as f:
+                bundle = json.load(f)
+            out = import_bundle(
                 profile=args.profile,
                 region=args.region,
                 instance_id=args.instance_id,
-                user_ids=args.user_id,
-                all_users=args.all_users,
+                bundle=bundle,
+                overwrite=args.overwrite,
+                dry_run=args.dry_run,
             )
-            if failures:
-                print(f"Completed with {failures} failures", file=sys.stderr)
-                return 2
-            print("Association complete")
+            print(json.dumps(out, indent=2))
             return 0
 
         raise RuntimeError("Unknown command")
 
-    except (ClientError, BotoCoreError) as e:
-        print(f"AWS error: {e}", file=sys.stderr)
-        return 1
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

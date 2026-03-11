@@ -1,4 +1,4 @@
-import type { ConnectRegion, DescribeInstance, InstanceSummary } from "../types/connect";
+import type { ConnectRegion, DescribeInstance, ExportBundleV1, InstanceSummary } from "../types/connect";
 
 async function json<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, {
@@ -32,10 +32,6 @@ export async function describeInstance(region: string, instanceId: string): Prom
   return out.instance;
 }
 
-export async function replicationStatus(region: string, instanceId: string): Promise<{ status: string | null; instance?: DescribeInstance }>{
-  return json(`/api/connect/replication-status?region=${encodeURIComponent(region)}&instanceId=${encodeURIComponent(instanceId)}`);
-}
-
 export async function snapshot(region: string, instanceId: string): Promise<any> {
   return json("/api/connect/snapshot", {
     method: "POST",
@@ -43,13 +39,20 @@ export async function snapshot(region: string, instanceId: string): Promise<any>
   });
 }
 
-export async function replicate(params: {
-  sourceRegion: string;
+export async function exportBundle(region: string, instanceId: string): Promise<ExportBundleV1> {
+  return json("/api/connect/export", {
+    method: "POST",
+    body: JSON.stringify({ region, instanceId })
+  });
+}
+
+export async function importBundle(params: {
+  region: string;
   instanceId: string;
-  replicaRegion: string;
-  replicaAlias: string;
+  bundle: ExportBundleV1;
+  overwrite?: boolean;
 }): Promise<any> {
-  return json("/api/connect/replicate", {
+  return json("/api/connect/import", {
     method: "POST",
     body: JSON.stringify(params)
   });
