@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Amazon Connect Instance Replicator (v3.1)
+Amazon Connect Instance Replicator (v3.2)
 Best-effort export/import of Connect configuration using primitive APIs.
 
-Bundle v3.1 scope:
+Bundle v3.2 scope:
   - Hours of Operation
   - Agent Statuses
   - Security Profiles
@@ -21,17 +21,21 @@ Bundle v3.1 scope:
   - Rules
   - Evaluation Forms
   - Vocabularies
-  - Lambda Functions (discovery + association + ARN replacement)
-  - Lex Bots V1/V2 (discovery + association + ARN replacement)
+  - Lambda Functions (discovery + association + ARN replacement + optional copy)
+  - Lex Bots V1/V2 (discovery + association + ARN replacement + optional copy)
 """
 
 import argparse
 import json
+import os
 import sys
+import tempfile
+import time
 import urllib.parse
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import boto3
+import requests
 from botocore.exceptions import ClientError, ParamValidationError
 
 
@@ -90,6 +94,14 @@ def _connect_client(profile: Optional[str], region: str):
 
 def _s3_client(profile: Optional[str], region: str):
     return _session(profile, region).client("s3")
+
+
+def _lambda_client(profile: Optional[str], region: str):
+    return _session(profile, region).client("lambda")
+
+
+def _lex_client(profile: Optional[str], region: str):
+    return _session(profile, region).client("lexv2-models")
 
 
 def _paginate(method, *, next_token_key: str = "NextToken", **kwargs) -> Iterable[Dict[str, Any]]:
@@ -791,6 +803,184 @@ def _copy_s3_prompt(s3_client, source_uri: str, target_bucket: str, target_key: 
     return f"s3://{target_bucket}/{target_key}"
 
 
+def _copy_lambda_function(
+    profile: Optional[str],
+    source_region: str,
+    target_region: str,
+    function_name: str,
+    dry_run: bool = False
+) -> Optional[str]:
+    """Copy a Lambda function from source region to target region."""
+    if source_region == target_region:
+        return None  # No copy needed
+    
+    source_lambda = _lambda_client(profile, source_region)
+    target_lambda = _lambda_client(profile, target_region)
+    
+    try:
+        # Get source function configuration
+        source_config = source_lambda.get_function(FunctionName=function_name)
+        config = source_config.get("Configuration", {})
+        code_location = source_config.get("Code", {}).get("Location")
+        
+        if not code_location:
+            print(f"  WARN: Cannot get code for Lambda '{function_name}'", file=sys.stderr)
+            return None
+        
+        # Check if function already exists in target
+        try:
+            target_lambda.get_function(FunctionName=function_name)
+            print(f"  Lambda '{function_name}' already exists in {target_region}")
+            return function_name
+        except target_lambda.exceptions.ResourceNotFoundException:
+            pass  # Function doesn't exist, we'll create it
+        
+        if dry_run:
+            print(f"  [DRY-RUN] Would copy Lambda '{function_name}' to {target_region}")
+            return function_name
+        
+        # Download code from source
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            resp = requests.get(code_location, timeout=300)
+            resp.raise_for_status()
+            tmp.write(resp.content)
+            tmp_path = tmp.name
+        
+        # Create function in target region
+        with open(tmp_path, "rb") as f:
+            zip_bytes = f.read()
+        
+        create_params = {
+            "FunctionName": function_name,
+            "Runtime": config.get("Runtime"),
+            "Role": config.get("Role"),  # IAM role must exist in target account
+            "Handler": config.get("Handler"),
+            "Code": {"ZipFile": zip_bytes},
+            "Description": config.get("Description", ""),
+            "Timeout": config.get("Timeout", 30),
+            "MemorySize": config.get("MemorySize", 128),
+        }
+        
+        # Add optional fields if present
+        if config.get("Environment"):
+            create_params["Environment"] = config["Environment"]
+        if config.get("VpcConfig") and config["VpcConfig"].get("SubnetIds"):
+            create_params["VpcConfig"] = config["VpcConfig"]
+        
+        # Filter out None values
+        create_params = {k: v for k, v in create_params.items() if v is not None}
+        
+        target_lambda.create_function(**create_params)
+        print(f"  Copied Lambda '{function_name}' to {target_region}")
+        
+        # Clean up temp file
+        os.unlink(tmp_path)
+        
+        return function_name
+        
+    except Exception as e:
+        print(f"  WARN: Failed to copy Lambda '{function_name}': {e}", file=sys.stderr)
+        return None
+
+
+def _copy_lex_bot(
+    profile: Optional[str],
+    source_region: str,
+    target_region: str,
+    bot_id: str,
+    dry_run: bool = False
+) -> Optional[str]:
+    """Export Lex V2 bot from source and import to target region."""
+    if source_region == target_region:
+        return None  # No copy needed
+    
+    source_lex = _lex_client(profile, source_region)
+    target_lex = _lex_client(profile, target_region)
+    
+    try:
+        # Get bot details
+        bot = source_lex.describe_bot(botId=bot_id)
+        bot_name = bot.get("botName")
+        
+        # Check if bot already exists in target by name
+        try:
+            paginator = target_lex.get_paginator("list_bots")
+            for page in paginator.paginate():
+                for b in page.get("botSummaries", []):
+                    if b.get("botName") == bot_name:
+                        print(f"  Lex bot '{bot_name}' already exists in {target_region}")
+                        return b.get("botId")
+        except Exception:
+            pass
+        
+        if dry_run:
+            print(f"  [DRY-RUN] Would copy Lex bot '{bot_name}' to {target_region}")
+            return bot_id
+        
+        # Export bot from source
+        export_resp = source_lex.create_export(
+            resourceSpecification={
+                "botExportSpecification": {
+                    "botId": bot_id,
+                    "botVersion": "DRAFT"
+                }
+            },
+            fileFormat="LexJson"
+        )
+        export_id = export_resp.get("exportId")
+        
+        # Wait for export to complete
+        for _ in range(60):  # Wait up to 5 minutes
+            status = source_lex.describe_export(exportId=export_id)
+            if status.get("exportStatus") == "Completed":
+                break
+            if status.get("exportStatus") == "Failed":
+                raise Exception(f"Export failed: {status.get('failureReasons')}")
+            time.sleep(5)
+        
+        # Download export file
+        download_url = status.get("downloadUrl")
+        if not download_url:
+            raise Exception("No download URL for export")
+        
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            resp = requests.get(download_url, timeout=300)
+            resp.raise_for_status()
+            tmp.write(resp.content)
+            tmp_path = tmp.name
+        
+        # Import to target region
+        with open(tmp_path, "rb") as f:
+            import_resp = target_lex.create_import(
+                importId=f"import-{bot_name}-{int(time.time())}",
+                resourceSpecification={
+                    "botImportSpecification": {
+                        "botName": bot_name,
+                        "roleArn": bot.get("roleArn"),  # Must exist in target
+                        "dataPrivacy": bot.get("dataPrivacy", {"childDirected": False})
+                    }
+                },
+                mergeStrategy="FailOnConflict",
+                filePassword=None
+            )
+        
+        # Upload the file
+        upload_url = import_resp.get("uploadUrl")
+        if upload_url:
+            with open(tmp_path, "rb") as f:
+                requests.put(upload_url, data=f.read())
+        
+        # Clean up
+        os.unlink(tmp_path)
+        
+        print(f"  Initiated Lex bot '{bot_name}' import to {target_region}")
+        return import_resp.get("importId")
+        
+    except Exception as e:
+        print(f"  WARN: Failed to copy Lex bot: {e}", file=sys.stderr)
+        return None
+
+
 def import_bundle(
     *,
     profile: Optional[str],
@@ -802,6 +992,8 @@ def import_bundle(
     continue_on_error: bool = False,
     skip_unsupported: bool = False,
     prompt_s3_bucket: Optional[str] = None,
+    copy_lambda: bool = False,
+    copy_lex: bool = False,
 ) -> Dict[str, Any]:
     version = bundle.get("version")
     if version not in (1, 2, 3):
@@ -833,10 +1025,25 @@ def import_bundle(
             replacements.append((src_arn, dst_arn))
 
     # -------------------------------------------------------------------------
-    # 0. Build Lambda/Lex ARN replacements (source region → target region)
+    # 0. Build base ARN replacements (region + instance ID)
     # -------------------------------------------------------------------------
     source_region = bundle.get("source", {}).get("region")
+    source_instance_id = bundle.get("source", {}).get("instanceId")
     target_region = region
+    target_instance_id = instance_id
+    
+    # Add instance ID replacement (for Connect ARNs like prompts, flows, etc.)
+    # arn:aws:connect:us-east-1:123456789012:instance/{SOURCE_INSTANCE}/prompt/xxx
+    #                                                    ↓
+    # arn:aws:connect:us-west-2:123456789012:instance/{TARGET_INSTANCE}/prompt/xxx
+    if source_instance_id and target_instance_id and source_instance_id != target_instance_id:
+        replacements.append((f"instance/{source_instance_id}/", f"instance/{target_instance_id}/"))
+        print(f"  Instance ID mapping: {source_instance_id} → {target_instance_id}")
+    
+    # Also replace region in Connect ARNs
+    if source_region and target_region and source_region != target_region:
+        replacements.append((f"arn:aws:connect:{source_region}:", f"arn:aws:connect:{target_region}:"))
+        print(f"  Region mapping: {source_region} → {target_region}")
     
     lambda_arn_replacements: List[Tuple[str, str]] = []
     lex_arn_replacements: List[Tuple[str, str]] = []
@@ -870,6 +1077,52 @@ def import_bundle(
     replacements.extend(lex_arn_replacements)
     
     print(f"Built {len(lambda_arn_replacements)} Lambda and {len(lex_arn_replacements)} Lex ARN replacements")
+
+    # -------------------------------------------------------------------------
+    # 0a. Copy Lambda functions to target region (if requested)
+    # -------------------------------------------------------------------------
+    if copy_lambda and source_region and source_region != target_region:
+        print(f"\nCopying Lambda functions from {source_region} to {target_region}...")
+        for lf in bundle.get("lambdaFunctions") or []:
+            func_name = lf.get("functionName")
+            if func_name:
+                try:
+                    result = _copy_lambda_function(profile, source_region, target_region, func_name, dry_run)
+                    if result:
+                        inc("copiedLambdas")
+                    else:
+                        inc("skippedLambdas")
+                except Exception as e:
+                    inc("failedLambdaCopies")
+                    add_error("lambdaCopy", {"functionName": func_name, "error": str(e)})
+                    if not continue_on_error:
+                        raise
+
+    # -------------------------------------------------------------------------
+    # 0b. Copy Lex bots to target region (if requested)
+    # -------------------------------------------------------------------------
+    if copy_lex and source_region and source_region != target_region:
+        print(f"\nCopying Lex bots from {source_region} to {target_region}...")
+        for lb in bundle.get("lexBots") or []:
+            if lb.get("lexVersion") == "V2":
+                alias_arn = lb.get("aliasArn")
+                if alias_arn:
+                    # Extract bot ID from ARN: arn:aws:lex:region:account:bot-alias/BOTID/ALIASID
+                    parts = alias_arn.split("/")
+                    if len(parts) >= 2:
+                        bot_id = parts[1] if "bot-alias" in alias_arn else None
+                        if bot_id:
+                            try:
+                                result = _copy_lex_bot(profile, source_region, target_region, bot_id, dry_run)
+                                if result:
+                                    inc("copiedLexBots")
+                                else:
+                                    inc("skippedLexBots")
+                            except Exception as e:
+                                inc("failedLexCopies")
+                                add_error("lexCopy", {"botId": bot_id, "error": str(e)})
+                                if not continue_on_error:
+                                    raise
 
     # -------------------------------------------------------------------------
     # 1. Hours of Operation
@@ -1333,6 +1586,68 @@ def import_bundle(
                 add_error("quickConnects", {"name": name, "action": "create", "error": str(e)})
 
     # -------------------------------------------------------------------------
+    # 7a. Prompts (V3) - MUST be mapped BEFORE flows/modules since they reference prompts
+    # -------------------------------------------------------------------------
+    if version >= 3:
+        # First, build map of existing prompts in target by name
+        existing_prompts: Dict[str, Dict[str, Any]] = {}
+        try:
+            for page in _paginate(client.list_prompts, InstanceId=instance_id, MaxResults=100):
+                for ps in page.get("PromptSummaryList") or []:
+                    if ps.get("Name"):
+                        existing_prompts[ps["Name"]] = ps
+        except ClientError:
+            pass
+
+        # Map source prompts to target prompts by name (for ARN replacement in flows)
+        print(f"Processing {len(bundle.get('prompts') or [])} prompts from bundle...")
+        for pr in bundle.get("prompts") or []:
+            name = pr.get("name")
+            if not name:
+                continue
+            existing = existing_prompts.get(name)
+
+            if existing and existing.get("Id"):
+                # Prompt exists in target - add ARN replacement mapping
+                src_id = pr.get("id")
+                dst_id = existing["Id"]
+                src_arn = pr.get("arn")
+                dst_arn = existing.get("Arn")
+                add_repl(src_id, dst_id, src_arn, dst_arn)
+                print(f"  Mapped prompt '{name}': {src_arn} → {dst_arn}")
+                inc("mappedPrompts")
+                continue
+
+            # Prompt doesn't exist in target - try to create if S3 bucket provided
+            s3_uri = pr.get("s3Uri")
+            if not s3_uri or not prompt_s3_bucket:
+                inc("skippedPrompts")
+                print(f"  WARN: Prompt '{name}' not found in target and no S3 bucket provided for creation", file=sys.stderr)
+                continue
+
+            if dry_run:
+                inc("createdPrompts")
+                continue
+            try:
+                # Copy S3 file
+                target_key = f"connect-prompts/{instance_id}/{name}.wav"
+                new_s3_uri = _copy_s3_prompt(s3_client, s3_uri, prompt_s3_bucket, target_key)
+                resp = client.create_prompt(**_drop_none({
+                    "InstanceId": instance_id,
+                    "Name": name,
+                    "Description": pr.get("description"),
+                    "S3Uri": new_s3_uri,
+                    "Tags": pr.get("tags"),
+                }))
+                inc("createdPrompts")
+                add_repl(pr.get("id"), resp.get("PromptId"), pr.get("arn"), resp.get("PromptARN"))
+            except (ClientError, ParamValidationError) as e:
+                if not continue_on_error:
+                    raise
+                inc("failedPrompts")
+                add_error("prompts", {"name": name, "action": "create", "error": str(e)})
+
+    # -------------------------------------------------------------------------
     # 8. Flow Modules
     # -------------------------------------------------------------------------
     existing_modules: Dict[str, Dict[str, Any]] = {}
@@ -1558,54 +1873,7 @@ def import_bundle(
                     add_error("predefinedAttributes", {"name": name, "action": "create", "error": str(e)})
 
     # -------------------------------------------------------------------------
-    # 12. Prompts (V3) - requires S3 bucket for audio copy
-    # -------------------------------------------------------------------------
-    if version >= 3 and prompt_s3_bucket:
-        existing_prompts: Dict[str, Dict[str, Any]] = {}
-        try:
-            for page in _paginate(client.list_prompts, InstanceId=instance_id, MaxResults=100):
-                for ps in page.get("PromptSummaryList") or []:
-                    if ps.get("Name"):
-                        existing_prompts[ps["Name"]] = ps
-        except ClientError:
-            pass
-
-        for pr in bundle.get("prompts") or []:
-            name = pr.get("name")
-            s3_uri = pr.get("s3Uri")
-            if not name or not s3_uri:
-                continue
-            existing = existing_prompts.get(name)
-
-            if existing and existing.get("Id"):
-                add_repl(pr.get("id"), existing["Id"], pr.get("arn"), existing.get("Arn"))
-                inc("skippedPrompts")  # Can't update prompt audio
-                continue
-
-            if dry_run:
-                inc("createdPrompts")
-                continue
-            try:
-                # Copy S3 file
-                target_key = f"connect-prompts/{instance_id}/{name}.wav"
-                new_s3_uri = _copy_s3_prompt(s3_client, s3_uri, prompt_s3_bucket, target_key)
-                resp = client.create_prompt(**_drop_none({
-                    "InstanceId": instance_id,
-                    "Name": name,
-                    "Description": pr.get("description"),
-                    "S3Uri": new_s3_uri,
-                    "Tags": pr.get("tags"),
-                }))
-                inc("createdPrompts")
-                add_repl(pr.get("id"), resp.get("PromptId"), pr.get("arn"), resp.get("PromptARN"))
-            except (ClientError, ParamValidationError) as e:
-                if not continue_on_error:
-                    raise
-                inc("failedPrompts")
-                add_error("prompts", {"name": name, "action": "create", "error": str(e)})
-
-    # -------------------------------------------------------------------------
-    # 13. Task Templates (V3)
+    # 12. Task Templates (V3)
     # -------------------------------------------------------------------------
     if version >= 3:
         existing_task_templates: Dict[str, Dict[str, Any]] = {}
@@ -2082,6 +2350,8 @@ def build_parser() -> argparse.ArgumentParser:
     imp.add_argument("--continue-on-error", action="store_true", help="Continue importing after errors")
     imp.add_argument("--skip-unsupported", action="store_true", help="Skip flows/modules with external deps")
     imp.add_argument("--prompt-s3-bucket", default=None, help="S3 bucket in target region for prompt audio files")
+    imp.add_argument("--copy-lambda", action="store_true", help="Copy Lambda functions from source region to target region")
+    imp.add_argument("--copy-lex", action="store_true", help="Copy Lex bots from source region to target region")
 
     return p
 
@@ -2114,6 +2384,8 @@ def main(argv: List[str]) -> int:
                 continue_on_error=args.continue_on_error,
                 skip_unsupported=args.skip_unsupported,
                 prompt_s3_bucket=getattr(args, "prompt_s3_bucket", None),
+                copy_lambda=getattr(args, "copy_lambda", False),
+                copy_lex=getattr(args, "copy_lex", False),
             )
             print(json.dumps(out, indent=2))
             return 0
