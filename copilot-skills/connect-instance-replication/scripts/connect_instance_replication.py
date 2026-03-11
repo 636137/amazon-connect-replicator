@@ -1,15 +1,43 @@
 #!/usr/bin/env python3
+"""
+Amazon Connect Instance Replication - Skill Wrapper (v2.0)
+
+Wraps the amazon-connect-replicator CLI to provide on-demand cross-region
+replication of Amazon Connect instance configuration.
+
+Supported resource types (19 total):
+  1. Hours of Operation
+  2. Agent Statuses
+  3. Security Profiles
+  4. User Hierarchy Groups
+  5. Queues (STANDARD)
+  6. Routing Profiles
+  7. Quick Connects
+  8. Contact Flow Modules
+  9. Contact Flows
+  10. Instance Attributes
+  11. Predefined Attributes
+  12. Prompts
+  13. Task Templates
+  14. Views
+  15. Rules
+  16. Evaluation Forms
+  17. Vocabularies
+  18. Lambda Functions (discovery + ARN replacement)
+  19. Lex Bots (discovery + ARN replacement)
+"""
 
 import argparse
 import json
 import os
 import random
+import re
 import string
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import boto3
 from botocore.exceptions import ClientError
@@ -91,6 +119,48 @@ def _resolve_replicator_script() -> Path:
     )
 
 
+def _extract_json_from_output(output: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    Extract JSON object from mixed output (info messages + JSON).
+    Returns (parsed_json, prefix_text) or (None, full_output) if no JSON found.
+    """
+    # Find the last JSON object in the output (starts with { and ends with })
+    # The replicator outputs info messages before the final JSON result
+    lines = output.strip().split('\n')
+    json_start = -1
+    brace_count = 0
+    
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith('{') and json_start == -1:
+            json_start = i
+            brace_count = stripped.count('{') - stripped.count('}')
+        elif json_start != -1:
+            brace_count += stripped.count('{') - stripped.count('}')
+        
+        if json_start != -1 and brace_count == 0:
+            # Found complete JSON block
+            prefix = '\n'.join(lines[:json_start])
+            json_text = '\n'.join(lines[json_start:i+1])
+            try:
+                return json.loads(json_text), prefix
+            except json.JSONDecodeError:
+                # Reset and keep looking
+                json_start = -1
+                brace_count = 0
+    
+    # Try parsing from the last { to end
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip().startswith('{'):
+            json_text = '\n'.join(lines[i:])
+            try:
+                return json.loads(json_text), '\n'.join(lines[:i])
+            except json.JSONDecodeError:
+                continue
+    
+    return None, output
+
+
 def _run_replicator(
     *,
     replicator_script: Path,
@@ -100,6 +170,35 @@ def _run_replicator(
 ) -> Any:
     cmd = [sys.executable, str(replicator_script)] + args
     proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    
+    if capture_json:
+        # Try to extract JSON even if there's mixed output
+        parsed, prefix = _extract_json_from_output(proc.stdout)
+        
+        if parsed is not None:
+            # Print prefix info to stderr so it's visible but doesn't break JSON
+            if prefix.strip():
+                print(prefix.strip(), file=sys.stderr)
+            if proc.stderr.strip():
+                print(proc.stderr.strip(), file=sys.stderr)
+            return parsed
+        
+        # No JSON found - check if it's an error
+        if proc.returncode != 0:
+            raise RuntimeError(
+                "Replicator CLI failed:\n"
+                f"  cmd: {' '.join(cmd)}\n"
+                f"  exit: {proc.returncode}\n"
+                f"  stdout: {proc.stdout.strip()}\n"
+                f"  stderr: {proc.stderr.strip()}\n"
+            )
+        raise RuntimeError(
+            "Replicator did not return valid JSON on stdout.\n"
+            f"stdout: {proc.stdout.strip()}\n"
+            f"stderr: {proc.stderr.strip()}\n"
+        )
+    
+    # Not capturing JSON - just check return code
     if proc.returncode != 0:
         raise RuntimeError(
             "Replicator CLI failed:\n"
@@ -108,16 +207,6 @@ def _run_replicator(
             f"  stdout: {proc.stdout.strip()}\n"
             f"  stderr: {proc.stderr.strip()}\n"
         )
-    if capture_json:
-        try:
-            return json.loads(proc.stdout)
-        except Exception as e:
-            raise RuntimeError(
-                "Replicator did not return valid JSON on stdout.\n"
-                f"Parse error: {e}\n"
-                f"stdout: {proc.stdout.strip()}\n"
-                f"stderr: {proc.stderr.strip()}\n"
-            )
     return proc.stdout
 
 
@@ -145,35 +234,204 @@ def resolve_instance_id(*, profile: Optional[str], region: str, instance_id: Opt
 
 
 def verify_counts(*, profile: Optional[str], region: str, instance_id: str) -> Dict[str, int]:
+    """
+    Verify resource counts for all 19 supported resource types in the target instance.
+    """
     client = _connect_client(profile, region)
+    counts: Dict[str, int] = {}
 
-    hours = 0
-    for page in _paginate(client.list_hours_of_operations, InstanceId=instance_id, MaxResults=100):
-        hours += len(page.get("HoursOfOperationSummaryList") or [])
+    # 1. Hours of Operation
+    try:
+        hours = 0
+        for page in _paginate(client.list_hours_of_operations, InstanceId=instance_id, MaxResults=100):
+            hours += len(page.get("HoursOfOperationSummaryList") or [])
+        counts["hoursOfOperations"] = hours
+    except ClientError as e:
+        print(f"WARN: Could not count hours of operations: {e}", file=sys.stderr)
 
-    queues = 0
-    for page in _paginate(client.list_queues, InstanceId=instance_id, MaxResults=100, QueueTypes=["STANDARD"]):
-        queues += len(page.get("QueueSummaryList") or [])
+    # 2. Agent Statuses
+    try:
+        agent_statuses = 0
+        for page in _paginate(client.list_agent_statuses, InstanceId=instance_id, MaxResults=100):
+            agent_statuses += len(page.get("AgentStatusSummaryList") or [])
+        counts["agentStatuses"] = agent_statuses
+    except ClientError as e:
+        print(f"WARN: Could not count agent statuses: {e}", file=sys.stderr)
 
-    modules = 0
-    for page in _paginate(client.list_contact_flow_modules, InstanceId=instance_id, MaxResults=100):
-        modules += len(page.get("ContactFlowModulesSummaryList") or [])
+    # 3. Security Profiles
+    try:
+        security_profiles = 0
+        for page in _paginate(client.list_security_profiles, InstanceId=instance_id, MaxResults=100):
+            security_profiles += len(page.get("SecurityProfileSummaryList") or [])
+        counts["securityProfiles"] = security_profiles
+    except ClientError as e:
+        print(f"WARN: Could not count security profiles: {e}", file=sys.stderr)
 
-    flows = 0
-    for page in _paginate(
-        client.list_contact_flows,
-        InstanceId=instance_id,
-        MaxResults=100,
-        ContactFlowTypes=CONTACT_FLOW_TYPES,
-    ):
-        flows += len(page.get("ContactFlowSummaryList") or [])
+    # 4. User Hierarchy Groups
+    try:
+        hierarchy_groups = 0
+        for page in _paginate(client.list_user_hierarchy_groups, InstanceId=instance_id, MaxResults=100):
+            hierarchy_groups += len(page.get("UserHierarchyGroupSummaryList") or [])
+        counts["userHierarchyGroups"] = hierarchy_groups
+    except ClientError as e:
+        print(f"WARN: Could not count user hierarchy groups: {e}", file=sys.stderr)
 
-    return {
-        "hours": hours,
-        "queues": queues,
-        "modules": modules,
-        "flows": flows,
-    }
+    # 5. Queues (STANDARD only)
+    try:
+        queues = 0
+        for page in _paginate(client.list_queues, InstanceId=instance_id, MaxResults=100, QueueTypes=["STANDARD"]):
+            queues += len(page.get("QueueSummaryList") or [])
+        counts["queues"] = queues
+    except ClientError as e:
+        print(f"WARN: Could not count queues: {e}", file=sys.stderr)
+
+    # 6. Routing Profiles
+    try:
+        routing_profiles = 0
+        for page in _paginate(client.list_routing_profiles, InstanceId=instance_id, MaxResults=100):
+            routing_profiles += len(page.get("RoutingProfileSummaryList") or [])
+        counts["routingProfiles"] = routing_profiles
+    except ClientError as e:
+        print(f"WARN: Could not count routing profiles: {e}", file=sys.stderr)
+
+    # 7. Quick Connects
+    try:
+        quick_connects = 0
+        for page in _paginate(client.list_quick_connects, InstanceId=instance_id, MaxResults=100):
+            quick_connects += len(page.get("QuickConnectSummaryList") or [])
+        counts["quickConnects"] = quick_connects
+    except ClientError as e:
+        print(f"WARN: Could not count quick connects: {e}", file=sys.stderr)
+
+    # 8. Contact Flow Modules
+    try:
+        modules = 0
+        for page in _paginate(client.list_contact_flow_modules, InstanceId=instance_id, MaxResults=100):
+            modules += len(page.get("ContactFlowModulesSummaryList") or [])
+        counts["flowModules"] = modules
+    except ClientError as e:
+        print(f"WARN: Could not count flow modules: {e}", file=sys.stderr)
+
+    # 9. Contact Flows
+    try:
+        flows = 0
+        for page in _paginate(
+            client.list_contact_flows,
+            InstanceId=instance_id,
+            MaxResults=100,
+            ContactFlowTypes=CONTACT_FLOW_TYPES,
+        ):
+            flows += len(page.get("ContactFlowSummaryList") or [])
+        counts["contactFlows"] = flows
+    except ClientError as e:
+        print(f"WARN: Could not count contact flows: {e}", file=sys.stderr)
+
+    # 10. Instance Attributes (count enabled ones)
+    try:
+        instance_attrs = 0
+        attr_types = [
+            "INBOUND_CALLS", "OUTBOUND_CALLS", "CONTACTFLOW_LOGS", "CONTACT_LENS",
+            "AUTO_RESOLVE_BEST_VOICES", "USE_CUSTOM_TTS_VOICES", "EARLY_MEDIA",
+            "MULTI_PARTY_CONFERENCE", "HIGH_VOLUME_OUTBOUND", "ENHANCED_CONTACT_MONITORING",
+        ]
+        for attr_type in attr_types:
+            try:
+                resp = client.describe_instance_attribute(InstanceId=instance_id, AttributeType=attr_type)
+                if resp.get("Attribute", {}).get("Value"):
+                    instance_attrs += 1
+            except ClientError:
+                pass
+        counts["instanceAttributes"] = instance_attrs
+    except ClientError as e:
+        print(f"WARN: Could not count instance attributes: {e}", file=sys.stderr)
+
+    # 11. Predefined Attributes
+    try:
+        predefined_attrs = 0
+        for page in _paginate(client.list_predefined_attributes, InstanceId=instance_id, MaxResults=100):
+            predefined_attrs += len(page.get("PredefinedAttributeSummaryList") or [])
+        counts["predefinedAttributes"] = predefined_attrs
+    except ClientError as e:
+        print(f"WARN: Could not count predefined attributes: {e}", file=sys.stderr)
+
+    # 12. Prompts
+    try:
+        prompts = 0
+        for page in _paginate(client.list_prompts, InstanceId=instance_id, MaxResults=100):
+            prompts += len(page.get("PromptSummaryList") or [])
+        counts["prompts"] = prompts
+    except ClientError as e:
+        print(f"WARN: Could not count prompts: {e}", file=sys.stderr)
+
+    # 13. Task Templates
+    try:
+        task_templates = 0
+        for page in _paginate(client.list_task_templates, InstanceId=instance_id, MaxResults=100):
+            task_templates += len(page.get("TaskTemplates") or [])
+        counts["taskTemplates"] = task_templates
+    except ClientError as e:
+        print(f"WARN: Could not count task templates: {e}", file=sys.stderr)
+
+    # 14. Views
+    try:
+        views = 0
+        for page in _paginate(client.list_views, InstanceId=instance_id, MaxResults=100):
+            views += len(page.get("ViewsSummaryList") or [])
+        counts["views"] = views
+    except ClientError as e:
+        print(f"WARN: Could not count views: {e}", file=sys.stderr)
+
+    # 15. Rules
+    try:
+        rules = 0
+        # Rules require PublishStatus filter
+        for status in ["DRAFT", "PUBLISHED"]:
+            try:
+                for page in _paginate(client.list_rules, InstanceId=instance_id, MaxResults=100, PublishStatus=status):
+                    rules += len(page.get("RuleSummaryList") or [])
+            except ClientError:
+                pass
+        counts["rules"] = rules
+    except ClientError as e:
+        print(f"WARN: Could not count rules: {e}", file=sys.stderr)
+
+    # 16. Evaluation Forms
+    try:
+        eval_forms = 0
+        for page in _paginate(client.list_evaluation_forms, InstanceId=instance_id, MaxResults=100):
+            eval_forms += len(page.get("EvaluationFormSummaryList") or [])
+        counts["evaluationForms"] = eval_forms
+    except ClientError as e:
+        print(f"WARN: Could not count evaluation forms: {e}", file=sys.stderr)
+
+    # 17. Vocabularies
+    try:
+        vocabularies = 0
+        for page in _paginate(client.search_vocabularies, InstanceId=instance_id, MaxResults=100):
+            vocabularies += len(page.get("VocabularySummaryList") or [])
+        counts["vocabularies"] = vocabularies
+    except ClientError as e:
+        print(f"WARN: Could not count vocabularies: {e}", file=sys.stderr)
+
+    # 18. Lambda Function Associations
+    try:
+        lambdas = 0
+        for page in _paginate(client.list_lambda_functions, InstanceId=instance_id, MaxResults=25):
+            lambdas += len(page.get("LambdaFunctions") or [])
+        counts["lambdaFunctions"] = lambdas
+    except ClientError as e:
+        print(f"WARN: Could not count lambda functions: {e}", file=sys.stderr)
+
+    # 19. Lex Bot Associations
+    try:
+        lex_bots = 0
+        for page in _paginate(client.list_lex_bots, InstanceId=instance_id, MaxResults=25):
+            lex_bots += len(page.get("LexBots") or [])
+        counts["lexBots"] = lex_bots
+    except ClientError as e:
+        print(f"WARN: Could not count lex bots: {e}", file=sys.stderr)
+
+    return counts
 
 
 def cmd_discover(args: argparse.Namespace) -> int:
