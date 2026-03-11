@@ -23,27 +23,34 @@ Provision your target instance in advance (via Console, CLI, or IaC), then use t
 - `tools/connect-instance-replicator`: Python CLI (boto3) to export/import bundles (recommended for automation)
 - `copilot-skills/connect-instance-replication`: a vendored **Copilot Skill** (plus helper script) to run replication on-demand
 
-## Supported resources (bundle v2)
+## Supported resources (bundle v3)
 
 Export (source) → import (target):
 
-| Resource | Export APIs | Import APIs |
-|----------|-------------|-------------|
-| **Hours of Operation** | `ListHoursOfOperations` + `DescribeHoursOfOperation` | `CreateHoursOfOperation` / `UpdateHoursOfOperation` |
-| **Agent Statuses** | `ListAgentStatuses` + `DescribeAgentStatus` | `CreateAgentStatus` / `UpdateAgentStatus` |
-| **Security Profiles** | `ListSecurityProfiles` + `DescribeSecurityProfile` | `CreateSecurityProfile` / `UpdateSecurityProfile` |
-| **User Hierarchy Groups** | `ListUserHierarchyGroups` + `DescribeUserHierarchyGroup` | `CreateUserHierarchyGroup` / `UpdateUserHierarchyGroup*` |
-| **Queues (STANDARD)** | `ListQueues` + `DescribeQueue` | `CreateQueue` + `UpdateQueue*` |
-| **Routing Profiles** | `ListRoutingProfiles` + `DescribeRoutingProfile` | `CreateRoutingProfile` / `UpdateRoutingProfile*` |
-| **Quick Connects** | `ListQuickConnects` + `DescribeQuickConnect` | `CreateQuickConnect` / `UpdateQuickConnect*` |
-| **Contact Flow Modules** | `ListContactFlowModules` + `DescribeContactFlowModule` | `CreateContactFlowModule` / `UpdateContactFlowModuleContent` |
-| **Contact Flows** | `ListContactFlows` + `DescribeContactFlow` | `CreateContactFlow` / `UpdateContactFlowContent` |
-| **Instance Attributes** | `DescribeInstanceAttribute` | `UpdateInstanceAttribute` |
+| # | Resource | Export APIs | Import APIs |
+|---|----------|-------------|-------------|
+| 1 | **Hours of Operation** | `ListHoursOfOperations` + `DescribeHoursOfOperation` | `Create/Update` |
+| 2 | **Agent Statuses** | `ListAgentStatuses` + `DescribeAgentStatus` | `Create/Update` |
+| 3 | **Security Profiles** | `ListSecurityProfiles` + `DescribeSecurityProfile` | `Create/Update` |
+| 4 | **User Hierarchy Groups** | `ListUserHierarchyGroups` + `DescribeUserHierarchyGroup` | `Create/Update` |
+| 5 | **Queues (STANDARD)** | `ListQueues` + `DescribeQueue` | `CreateQueue` + `UpdateQueue*` |
+| 6 | **Routing Profiles** | `ListRoutingProfiles` + `DescribeRoutingProfile` | `Create/Update*` |
+| 7 | **Quick Connects** | `ListQuickConnects` + `DescribeQuickConnect` | `Create/Update*` |
+| 8 | **Contact Flow Modules** | `ListContactFlowModules` + `DescribeContactFlowModule` | `Create/UpdateContent` |
+| 9 | **Contact Flows** | `ListContactFlows` + `DescribeContactFlow` | `Create/UpdateContent` |
+| 10 | **Instance Attributes** | `DescribeInstanceAttribute` | `UpdateInstanceAttribute` |
+| 11 | **Predefined Attributes** | `ListPredefinedAttributes` + `Describe` | `Create/Update` |
+| 12 | **Prompts** | `ListPrompts` + `DescribePrompt` | `CreatePrompt` (with S3 copy) |
+| 13 | **Task Templates** | `ListTaskTemplates` + `GetTaskTemplate` | `Create/Update` |
+| 14 | **Views** | `ListViews` + `DescribeView` | `CreateView/UpdateViewContent` |
+| 15 | **Rules** | `ListRules` + `DescribeRule` | `Create/Update` |
+| 16 | **Evaluation Forms** | `ListEvaluationForms` + `DescribeEvaluationForm` | `CreateEvaluationForm` |
+| 17 | **Vocabularies** | `SearchVocabularies` + `DescribeVocabulary` | `CreateVocabulary` |
 
 Matching is **by name** (and for flows: `type|name`) and then upserted.
 
 Import order is dependency-aware:
-1. Hours → 2. Agent Statuses → 3. Security Profiles → 4. Hierarchy Groups → 5. Queues → 6. Routing Profiles → 7. Quick Connects → 8. Modules → 9. Flows → 10. Instance Attributes
+1. Hours → 2. Agent Statuses → 3. Security Profiles → 4. Hierarchy Groups → 5. Queues → 6. Routing Profiles → 7. Quick Connects → 8. Modules → 9. Flows → 10. Instance Attrs → 11. Predefined Attrs → 12. Prompts → 13. Task Templates → 14. Views → 15. Rules → 16. Eval Forms → 17. Vocabularies
 
 ## What this does NOT do (by design / API reality)
 
@@ -52,8 +59,7 @@ Amazon Connect does **not** offer a single API to "clone an instance" end-to-end
 Resources that are **not** replicated:
 - Phone numbers / telephony claims (region-specific)
 - Users (require identity provider setup)
-- Prompts / audio assets (require S3 migration)
-- Lex bots, Lambda functions, S3 assets (must exist in target region)
+- Lex bots, Lambda functions (external AWS resources)
 
 ## Reliability notes (lessons learned from live replication)
 
@@ -80,148 +86,24 @@ npm run dev
 - `POST /api/connect/import` → `{ region, instanceId, overwrite?, dryRun?, bundle }`
 
 ## Python CLI (recommended for automation)
+
+```bash
+# Export
+python3 tools/connect-instance-replicator/connect_instance_replicate.py export \
+  --region us-east-1 --instance-id SOURCE_ID --out bundle.json
+
+# Import (with prompts)
+python3 tools/connect-instance-replicator/connect_instance_replicate.py import \
+  --region us-west-2 --instance-id TARGET_ID --in bundle.json \
+  --overwrite --continue-on-error --skip-unsupported \
+  --prompt-s3-bucket my-bucket-us-west-2
+```
+
 See: [`tools/connect-instance-replicator/README.md`](tools/connect-instance-replicator/README.md)
 
-## Copilot Skill: connect-instance-replication (run on demand)
+## Copilot Skill
 
-This repo vendors a Copilot skill you can install into your local Copilot CLI so you can run:
-
-- instance discovery (list instances by region)
-- export → import into existing target → verify counts
-
-…with the same proven importer hardening (omit nils, longest-first replacements, two-pass flow rewrites).
-
-### Skill location in this repo
-
-- `copilot-skills/connect-instance-replication/SKILL.md`
-- `copilot-skills/connect-instance-replication/scripts/connect_instance_replication.py`
-
-### Install the skill locally
-
-1) Copy the skill folder into your Copilot skills directory:
-
-```bash
-mkdir -p ~/.copilot/skills
-cp -R ./copilot-skills/connect-instance-replication ~/.copilot/skills/connect-instance-replication
-```
-
-2) Install Python deps for the helper script:
-
-```bash
-pip3 install -r ~/.copilot/skills/connect-instance-replication/requirements.txt
-```
-
-### How the skill works
-
-The helper script is a thin wrapper around the repo's replicator CLI:
-
-- `tools/connect-instance-replicator/connect_instance_replicate.py`
-
-It uses primitive Amazon Connect APIs (via boto3) to:
-
-1) resolve instance IDs (by alias) using `ListInstances`
-2) export a bundle from the source instance (all v2 resources)
-3) import the bundle into the pre-existing target instance (create/update)
-4) verify counts and write a small report set
-
-### Safety guardrails
-
-- Any live action that can change AWS state requires `--yes`.
-- `--dry-run` is supported for import (no Create/Update calls).
-
-### Where artifacts are written
-
-Each run writes a timestamped directory (by default):
-
-- `~/Downloads/acr-replication-runs/<runId>/`
-
-Containing:
-
-- `bundle.json` (exported configuration)
-- `import-report.json` (import results from the underlying replicator)
-- `verify.json` (post-import resource counts)
-
-The script prints a final JSON summary to stdout with the runId, artifact paths, and verification counts.
-
-### Usage examples
-
-#### 1) Discover instances in a region
-
-```bash
-python3 ~/.copilot/skills/connect-instance-replication/scripts/connect_instance_replication.py discover \
-  --region us-east-1
-```
-
-Expected result (shape):
-
-```json
-{
-  "region": "us-east-1",
-  "instances": [
-    {
-      "alias": "my-prod-connect",
-      "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-      "arn": "arn:aws:connect:us-east-1:123456789012:instance/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-      "status": "ACTIVE",
-      "created": "2026-03-01T12:34:56+00:00"
-    }
-  ]
-}
-```
-
-#### 2) Replicate into an existing target instance
-
-```bash
-python3 ~/.copilot/skills/connect-instance-replication/scripts/connect_instance_replication.py replicate \
-  --source-region us-east-1 \
-  --source-alias my-prod-connect \
-  --target-region us-west-2 \
-  --target-alias my-dr-connect \
-  --overwrite \
-  --skip-unsupported \
-  --continue-on-error \
-  --yes
-```
-
-Expected results:
-- A bundle is exported from the source instance.
-- The bundle is imported into the target instance.
-- A summary JSON is printed and artifacts are written to the run folder.
-
-Example summary output (shape):
-
-```json
-{
-  "runId": "20260311T190000Z-abc123",
-  "workdir": "/Users/you/Downloads/acr-replication-runs/20260311T190000Z-abc123",
-  "source": { "region": "us-east-1", "instanceId": "..." },
-  "target": { "region": "us-west-2", "instanceId": "..." },
-  "paths": {
-    "bundle": ".../bundle.json",
-    "importReport": ".../import-report.json",
-    "verify": ".../verify.json"
-  },
-  "verifyCounts": { "hours": 2, "queues": 6, "modules": 0, "flows": 21 }
-}
-```
-
-#### 3) Dry-run import (no Create/Update calls)
-
-```bash
-python3 ~/.copilot/skills/connect-instance-replication/scripts/connect_instance_replication.py replicate \
-  --source-region us-east-1 \
-  --source-instance-id SOURCE_INSTANCE_ID \
-  --target-region us-west-2 \
-  --target-instance-id TARGET_INSTANCE_ID \
-  --dry-run
-```
-
-### Environment variables
-
-If your repo is not in `~/amazon-connect-replicator`, set one of:
-
-- `ACR_REPO=/path/to/amazon-connect-replicator`
-- `ACR_REPLICATOR_SCRIPT=/full/path/to/connect_instance_replicate.py`
+See: [`copilot-skills/connect-instance-replication/SKILL.md`](copilot-skills/connect-instance-replication/SKILL.md)
 
 ## Example: live us-east-1 → us-west-2 replication
 

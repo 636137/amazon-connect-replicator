@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Amazon Connect Instance Replicator (v2)
+Amazon Connect Instance Replicator (v3)
 Best-effort export/import of Connect configuration using primitive APIs.
 
-Bundle v2 scope:
+Bundle v3 scope:
   - Hours of Operation
   - Agent Statuses
   - Security Profiles
@@ -13,11 +13,20 @@ Bundle v2 scope:
   - Quick Connects (queue + phone; user-type skipped)
   - Contact Flow Modules
   - Contact Flows
+  - Instance Attributes
+  - Predefined Attributes (NEW)
+  - Prompts (NEW, with S3 copy)
+  - Task Templates (NEW)
+  - Views (NEW)
+  - Rules (NEW)
+  - Evaluation Forms (NEW)
+  - Vocabularies (NEW)
 """
 
 import argparse
 import json
 import sys
+import urllib.parse
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import boto3
@@ -75,6 +84,10 @@ def _session(profile: Optional[str], region: str) -> boto3.session.Session:
 
 def _connect_client(profile: Optional[str], region: str):
     return _session(profile, region).client("connect")
+
+
+def _s3_client(profile: Optional[str], region: str):
+    return _session(profile, region).client("s3")
 
 
 def _paginate(method, *, next_token_key: str = "NextToken", **kwargs) -> Iterable[Dict[str, Any]]:
@@ -193,13 +206,12 @@ def _export_security_profiles(client, instance_id: str) -> List[Dict[str, Any]]:
             raise
         sp = d.get("SecurityProfile") or {}
         if sp.get("SecurityProfileName"):
-            # Get permissions
             perms: List[str] = []
             try:
                 for ppage in _paginate(client.list_security_profile_permissions, InstanceId=instance_id, SecurityProfileId=sid, MaxResults=100):
                     perms.extend(ppage.get("Permissions") or [])
             except ClientError:
-                pass  # may not have permission to list permissions
+                pass
             security_profiles.append({
                 "id": sp.get("Id"),
                 "arn": sp.get("Arn"),
@@ -297,7 +309,6 @@ def _export_routing_profiles(client, instance_id: str) -> List[Dict[str, Any]]:
             raise
         rp = d.get("RoutingProfile") or {}
         if rp.get("Name"):
-            # Get queue configs
             queue_configs: List[Dict[str, Any]] = []
             try:
                 for qpage in _paginate(client.list_routing_profile_queues, InstanceId=instance_id, RoutingProfileId=sid, MaxResults=100):
@@ -428,6 +439,228 @@ def _export_instance_attributes(client, instance_id: str) -> List[Dict[str, Any]
     return attrs
 
 
+# --- V3 NEW EXPORTS ---
+
+def _export_predefined_attributes(client, instance_id: str) -> List[Dict[str, Any]]:
+    """Export predefined attributes (routing skill tags)."""
+    attrs: List[Dict[str, Any]] = []
+    try:
+        for page in _paginate(client.list_predefined_attributes, InstanceId=instance_id, MaxResults=100):
+            for pa in page.get("PredefinedAttributeSummaryList") or []:
+                name = pa.get("Name")
+                if not name:
+                    continue
+                try:
+                    d = client.describe_predefined_attribute(InstanceId=instance_id, Name=name)
+                    pattr = d.get("PredefinedAttribute") or {}
+                    attrs.append({
+                        "name": pattr.get("Name"),
+                        "values": pattr.get("Values"),
+                        "lastModifiedTime": str(pattr.get("LastModifiedTime")) if pattr.get("LastModifiedTime") else None,
+                        "lastModifiedRegion": pattr.get("LastModifiedRegion"),
+                    })
+                except ClientError as e:
+                    print(f"WARN: skipping predefined attribute {name}: {e}", file=sys.stderr)
+    except ClientError as e:
+        print(f"WARN: list_predefined_attributes not available or failed: {e}", file=sys.stderr)
+    return attrs
+
+
+def _export_prompts(client, instance_id: str) -> List[Dict[str, Any]]:
+    """Export prompts (audio files metadata; S3 copy handled separately)."""
+    prompts: List[Dict[str, Any]] = []
+    try:
+        for page in _paginate(client.list_prompts, InstanceId=instance_id, MaxResults=100):
+            for ps in page.get("PromptSummaryList") or []:
+                pid = ps.get("Id")
+                if not pid:
+                    continue
+                try:
+                    d = client.describe_prompt(InstanceId=instance_id, PromptId=pid)
+                    pr = d.get("Prompt") or {}
+                    prompts.append({
+                        "id": pr.get("PromptId"),
+                        "arn": pr.get("PromptARN"),
+                        "name": pr.get("Name"),
+                        "description": pr.get("Description"),
+                        "s3Uri": pr.get("S3Uri"),
+                        "tags": pr.get("Tags"),
+                    })
+                except ClientError as e:
+                    print(f"WARN: skipping prompt {pid}: {e}", file=sys.stderr)
+    except ClientError as e:
+        print(f"WARN: list_prompts not available or failed: {e}", file=sys.stderr)
+    return prompts
+
+
+def _export_task_templates(client, instance_id: str) -> List[Dict[str, Any]]:
+    """Export task templates."""
+    templates: List[Dict[str, Any]] = []
+    try:
+        for page in _paginate(client.list_task_templates, InstanceId=instance_id, MaxResults=100):
+            for ts in page.get("TaskTemplates") or []:
+                tid = ts.get("Id")
+                if not tid:
+                    continue
+                try:
+                    d = client.get_task_template(InstanceId=instance_id, TaskTemplateId=tid)
+                    templates.append({
+                        "id": d.get("Id"),
+                        "arn": d.get("Arn"),
+                        "name": d.get("Name"),
+                        "description": d.get("Description"),
+                        "status": d.get("Status"),
+                        "fields": d.get("Fields"),
+                        "defaults": d.get("Defaults"),
+                        "constraints": d.get("Constraints"),
+                        "contactFlowId": d.get("ContactFlowId"),
+                        "tags": d.get("Tags"),
+                    })
+                except ClientError as e:
+                    print(f"WARN: skipping task template {tid}: {e}", file=sys.stderr)
+    except ClientError as e:
+        print(f"WARN: list_task_templates not available or failed: {e}", file=sys.stderr)
+    return templates
+
+
+def _export_views(client, instance_id: str) -> List[Dict[str, Any]]:
+    """Export views (step-by-step guides)."""
+    views: List[Dict[str, Any]] = []
+    try:
+        for page in _paginate(client.list_views, InstanceId=instance_id, MaxResults=100):
+            for vs in page.get("ViewsSummaryList") or []:
+                vid = vs.get("Id")
+                if not vid:
+                    continue
+                try:
+                    d = client.describe_view(InstanceId=instance_id, ViewId=vid)
+                    v = d.get("View") or {}
+                    views.append({
+                        "id": v.get("Id"),
+                        "arn": v.get("Arn"),
+                        "name": v.get("Name"),
+                        "description": v.get("Description"),
+                        "type": v.get("Type"),
+                        "status": v.get("Status"),
+                        "content": v.get("Content"),
+                        "tags": v.get("Tags"),
+                        "version": v.get("Version"),
+                        "versionDescription": v.get("VersionDescription"),
+                    })
+                except ClientError as e:
+                    print(f"WARN: skipping view {vid}: {e}", file=sys.stderr)
+    except ClientError as e:
+        print(f"WARN: list_views not available or failed: {e}", file=sys.stderr)
+    return views
+
+
+def _export_rules(client, instance_id: str) -> List[Dict[str, Any]]:
+    """Export rules (Contact Lens, event triggers)."""
+    rules: List[Dict[str, Any]] = []
+    try:
+        for page in _paginate(client.list_rules, InstanceId=instance_id, MaxResults=100, PublishStatus="PUBLISHED"):
+            for rs in page.get("RuleSummaryList") or []:
+                rid = rs.get("RuleId")
+                if not rid:
+                    continue
+                try:
+                    d = client.describe_rule(InstanceId=instance_id, RuleId=rid)
+                    r = d.get("Rule") or {}
+                    rules.append({
+                        "id": r.get("RuleId"),
+                        "arn": r.get("RuleArn"),
+                        "name": r.get("Name"),
+                        "publishStatus": r.get("PublishStatus"),
+                        "eventSourceName": r.get("EventSourceName"),
+                        "function": r.get("Function"),
+                        "actions": r.get("Actions"),
+                        "triggerEventSource": r.get("TriggerEventSource"),
+                        "tags": r.get("Tags"),
+                    })
+                except ClientError as e:
+                    print(f"WARN: skipping rule {rid}: {e}", file=sys.stderr)
+    except ClientError as e:
+        print(f"WARN: list_rules not available or failed: {e}", file=sys.stderr)
+    return rules
+
+
+def _export_evaluation_forms(client, instance_id: str) -> List[Dict[str, Any]]:
+    """Export evaluation forms (QA forms)."""
+    forms: List[Dict[str, Any]] = []
+    try:
+        for page in _paginate(client.list_evaluation_forms, InstanceId=instance_id, MaxResults=100):
+            for fs in page.get("EvaluationFormSummaryList") or []:
+                fid = fs.get("EvaluationFormId")
+                if not fid:
+                    continue
+                try:
+                    # Get the latest active version
+                    version = fs.get("LatestVersion") or fs.get("ActiveVersion") or 1
+                    d = client.describe_evaluation_form(InstanceId=instance_id, EvaluationFormId=fid, EvaluationFormVersion=version)
+                    ef = d.get("EvaluationForm") or {}
+                    forms.append({
+                        "id": ef.get("EvaluationFormId"),
+                        "arn": ef.get("EvaluationFormArn"),
+                        "title": ef.get("Title"),
+                        "description": ef.get("Description"),
+                        "status": ef.get("Status"),
+                        "items": ef.get("Items"),
+                        "scoringStrategy": ef.get("ScoringStrategy"),
+                        "tags": ef.get("Tags"),
+                    })
+                except ClientError as e:
+                    print(f"WARN: skipping evaluation form {fid}: {e}", file=sys.stderr)
+    except ClientError as e:
+        print(f"WARN: list_evaluation_forms not available or failed: {e}", file=sys.stderr)
+    return forms
+
+
+def _export_vocabularies(client, instance_id: str) -> List[Dict[str, Any]]:
+    """Export custom vocabularies (Contact Lens)."""
+    vocabs: List[Dict[str, Any]] = []
+    try:
+        for page in _paginate(client.list_default_vocabularies, InstanceId=instance_id, MaxResults=100):
+            for vs in page.get("DefaultVocabularyList") or []:
+                vid = vs.get("VocabularyId")
+                if vid:
+                    try:
+                        d = client.describe_vocabulary(InstanceId=instance_id, VocabularyId=vid)
+                        v = d.get("Vocabulary") or {}
+                        vocabs.append({
+                            "id": v.get("Id"),
+                            "arn": v.get("Arn"),
+                            "name": v.get("Name"),
+                            "languageCode": v.get("LanguageCode"),
+                            "state": v.get("State"),
+                            "content": v.get("Content"),
+                            "tags": v.get("Tags"),
+                        })
+                    except ClientError as e:
+                        print(f"WARN: skipping vocabulary {vid}: {e}", file=sys.stderr)
+        # Also try search_vocabularies for non-default
+        for page in _paginate(client.search_vocabularies, InstanceId=instance_id, MaxResults=100):
+            for vs in page.get("VocabularySummaryList") or []:
+                vid = vs.get("Id")
+                if vid and not any(v.get("id") == vid for v in vocabs):
+                    try:
+                        d = client.describe_vocabulary(InstanceId=instance_id, VocabularyId=vid)
+                        v = d.get("Vocabulary") or {}
+                        vocabs.append({
+                            "id": v.get("Id"),
+                            "arn": v.get("Arn"),
+                            "name": v.get("Name"),
+                            "languageCode": v.get("LanguageCode"),
+                            "state": v.get("State"),
+                            "content": v.get("Content"),
+                            "tags": v.get("Tags"),
+                        })
+                    except ClientError as e:
+                        print(f"WARN: skipping vocabulary {vid}: {e}", file=sys.stderr)
+    except ClientError as e:
+        print(f"WARN: vocabulary APIs not available or failed: {e}", file=sys.stderr)
+    return vocabs
+
+
 def export_bundle(*, profile: Optional[str], region: str, instance_id: str) -> Dict[str, Any]:
     client = _connect_client(profile, region)
 
@@ -441,9 +674,17 @@ def export_bundle(*, profile: Optional[str], region: str, instance_id: str) -> D
     flow_modules = _export_flow_modules(client, instance_id)
     contact_flows = _export_contact_flows(client, instance_id)
     instance_attributes = _export_instance_attributes(client, instance_id)
+    # V3 new
+    predefined_attributes = _export_predefined_attributes(client, instance_id)
+    prompts = _export_prompts(client, instance_id)
+    task_templates = _export_task_templates(client, instance_id)
+    views = _export_views(client, instance_id)
+    rules = _export_rules(client, instance_id)
+    evaluation_forms = _export_evaluation_forms(client, instance_id)
+    vocabularies = _export_vocabularies(client, instance_id)
 
     return {
-        "version": 2,
+        "version": 3,
         "exportedAt": __import__("datetime").datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
         "source": {"region": region, "instanceId": instance_id},
         "hoursOfOperations": hours_of_operations,
@@ -456,12 +697,32 @@ def export_bundle(*, profile: Optional[str], region: str, instance_id: str) -> D
         "flowModules": flow_modules,
         "contactFlows": contact_flows,
         "instanceAttributes": instance_attributes,
+        # V3 new
+        "predefinedAttributes": predefined_attributes,
+        "prompts": prompts,
+        "taskTemplates": task_templates,
+        "views": views,
+        "rules": rules,
+        "evaluationForms": evaluation_forms,
+        "vocabularies": vocabularies,
     }
 
 
 # =============================================================================
 # IMPORT
 # =============================================================================
+
+def _copy_s3_prompt(s3_client, source_uri: str, target_bucket: str, target_key: str) -> str:
+    """Copy a prompt's audio file from source S3 to target S3."""
+    # Parse s3://bucket/key from source_uri
+    parsed = urllib.parse.urlparse(source_uri)
+    src_bucket = parsed.netloc
+    src_key = parsed.path.lstrip("/")
+    
+    copy_source = {"Bucket": src_bucket, "Key": src_key}
+    s3_client.copy_object(CopySource=copy_source, Bucket=target_bucket, Key=target_key)
+    return f"s3://{target_bucket}/{target_key}"
+
 
 def import_bundle(
     *,
@@ -473,12 +734,14 @@ def import_bundle(
     dry_run: bool,
     continue_on_error: bool = False,
     skip_unsupported: bool = False,
+    prompt_s3_bucket: Optional[str] = None,
 ) -> Dict[str, Any]:
     version = bundle.get("version")
-    if version not in (1, 2):
+    if version not in (1, 2, 3):
         raise ValueError(f"Unsupported bundle version: {version}")
 
     client = _connect_client(profile, region)
+    s3_client = _s3_client(profile, region) if prompt_s3_bucket else None
 
     # Replacement mappings (source -> target)
     replacements: List[Tuple[str, str]] = []
@@ -651,7 +914,7 @@ def import_bundle(
                     "InstanceId": instance_id,
                     "SecurityProfileId": existing["Id"],
                     "Description": sp.get("description"),
-                    "Permissions": sp.get("permissions") or None,
+                    "Permissions": sp.get("permissions") or [],
                     "AllowedAccessControlTags": sp.get("allowedAccessControlTags"),
                     "TagRestrictedResources": sp.get("tagRestrictedResources"),
                 })
@@ -671,7 +934,7 @@ def import_bundle(
                     "InstanceId": instance_id,
                     "SecurityProfileName": name,
                     "Description": sp.get("description"),
-                    "Permissions": sp.get("permissions") or None,
+                    "Permissions": sp.get("permissions") or [],
                     "AllowedAccessControlTags": sp.get("allowedAccessControlTags"),
                     "TagRestrictedResources": sp.get("tagRestrictedResources"),
                     "Tags": sp.get("tags"),
@@ -721,7 +984,6 @@ def import_bundle(
                 inc("createdHierarchyGroups")
                 continue
             try:
-                # Note: parent hierarchy resolution is complex; we skip parent for now
                 resp = client.create_user_hierarchy_group(**_drop_none({
                     "InstanceId": instance_id,
                     "Name": name,
@@ -740,28 +1002,31 @@ def import_bundle(
     # 5. Queues
     # -------------------------------------------------------------------------
     existing_queues: Dict[str, Dict[str, Any]] = {}
-    for page in _paginate(client.list_queues, InstanceId=instance_id, MaxResults=100):
+    for page in _paginate(client.list_queues, InstanceId=instance_id, MaxResults=100, QueueTypes=["STANDARD"]):
         for q in page.get("QueueSummaryList") or []:
             if q.get("Name"):
                 existing_queues[q["Name"]] = q
-
-    def _resolve_hours_id(q: Dict[str, Any]) -> Optional[str]:
-        if q.get("hoursOfOperationName"):
-            eh = existing_hours.get(str(q["hoursOfOperationName"]))
-            if eh and eh.get("Id"):
-                return str(eh["Id"])
-        if q.get("hoursOfOperationId"):
-            for src, dst in replacements:
-                if src == q["hoursOfOperationId"]:
-                    return dst
-        return None
 
     for q in bundle.get("queues") or []:
         name = q.get("name")
         if not name:
             continue
         existing = existing_queues.get(name)
-        target_hours_id = _resolve_hours_id(q)
+
+        # Resolve hours by name
+        hours_name = q.get("hoursOfOperationName")
+        target_hours_id = None
+        if hours_name and hours_name in existing_hours:
+            target_hours_id = existing_hours[hours_name].get("Id")
+        if not target_hours_id:
+            src_hours_id = q.get("hoursOfOperationId")
+            if src_hours_id:
+                for r in replacements:
+                    if r[0] == src_hours_id:
+                        target_hours_id = r[1]
+                        break
+            if not target_hours_id:
+                target_hours_id = src_hours_id
 
         if existing and existing.get("Id"):
             add_repl(q.get("id"), existing["Id"], q.get("arn"), existing.get("Arn"))
@@ -772,15 +1037,23 @@ def import_bundle(
                 inc("updatedQueues")
                 continue
             try:
-                client.update_queue_name(InstanceId=instance_id, QueueId=existing["Id"], Name=name)
                 if q.get("description") is not None:
-                    client.update_queue_name(InstanceId=instance_id, QueueId=existing["Id"], Description=q.get("description"))
+                    client.update_queue_name(InstanceId=instance_id, QueueId=existing["Id"], Name=name, Description=q.get("description"))
                 if target_hours_id:
                     client.update_queue_hours_of_operation(InstanceId=instance_id, QueueId=existing["Id"], HoursOfOperationId=target_hours_id)
                 if q.get("maxContacts") is not None:
-                    client.update_queue_max_contacts(InstanceId=instance_id, QueueId=existing["Id"], MaxContacts=q["maxContacts"])
-                if q.get("status"):
-                    client.update_queue_status(InstanceId=instance_id, QueueId=existing["Id"], Status=q["status"])
+                    client.update_queue_max_contacts(InstanceId=instance_id, QueueId=existing["Id"], MaxContacts=q.get("maxContacts"))
+                if q.get("status") is not None:
+                    client.update_queue_status(InstanceId=instance_id, QueueId=existing["Id"], Status=q.get("status"))
+                occ = q.get("outboundCallerConfig")
+                if occ:
+                    occ_clean = _drop_none({
+                        "OutboundCallerIdName": occ.get("OutboundCallerIdName"),
+                        "OutboundCallerIdNumberId": occ.get("OutboundCallerIdNumberId"),
+                        "OutboundFlowId": occ.get("OutboundFlowId"),
+                    })
+                    if occ_clean:
+                        client.update_queue_outbound_caller_config(InstanceId=instance_id, QueueId=existing["Id"], OutboundCallerConfig=occ_clean)
                 inc("updatedQueues")
             except (ClientError, ParamValidationError) as e:
                 if not continue_on_error:
@@ -791,12 +1064,6 @@ def import_bundle(
             if dry_run:
                 inc("createdQueues")
                 continue
-            if not target_hours_id:
-                if continue_on_error:
-                    inc("failedQueues")
-                    add_error("queues", {"name": name, "action": "create", "error": "No hours-of-operation mapping found"})
-                    continue
-                raise ValueError(f"Queue {name}: could not resolve hours-of-operation")
             try:
                 resp = client.create_queue(**_drop_none({
                     "InstanceId": instance_id,
@@ -804,7 +1071,7 @@ def import_bundle(
                     "Description": q.get("description"),
                     "HoursOfOperationId": target_hours_id,
                     "MaxContacts": q.get("maxContacts"),
-                    "OutboundCallerConfig": q.get("outboundCallerConfig"),
+                    "OutboundCallerConfig": _drop_none(q.get("outboundCallerConfig") or {}),
                     "Tags": q.get("tags"),
                 }))
                 inc("createdQueues")
@@ -832,18 +1099,20 @@ def import_bundle(
         existing = existing_routing_profiles.get(name)
 
         # Resolve default outbound queue
-        default_queue_id = None
-        if rp.get("defaultOutboundQueueId"):
-            for src, dst in replacements:
-                if src == rp["defaultOutboundQueueId"]:
-                    default_queue_id = dst
+        def_out_q = rp.get("defaultOutboundQueueId")
+        target_def_q = None
+        if def_out_q:
+            for repl in replacements:
+                if repl[0] == def_out_q:
+                    target_def_q = repl[1]
                     break
-            if not default_queue_id:
-                # Try to find by name in existing queues
-                for eq_name, eq in existing_queues.items():
-                    if eq.get("Id") == rp["defaultOutboundQueueId"]:
-                        default_queue_id = eq["Id"]
+            if not target_def_q:
+                for qn, qinfo in existing_queues.items():
+                    if qinfo.get("Id") == def_out_q:
+                        target_def_q = def_out_q
                         break
+        if not target_def_q and existing_queues:
+            target_def_q = list(existing_queues.values())[0].get("Id")
 
         if existing and existing.get("Id"):
             add_repl(rp.get("id"), existing["Id"], rp.get("arn"), existing.get("Arn"))
@@ -854,11 +1123,13 @@ def import_bundle(
                 inc("updatedRoutingProfiles")
                 continue
             try:
-                client.update_routing_profile_name(InstanceId=instance_id, RoutingProfileId=existing["Id"], Name=name, Description=rp.get("description"))
-                if default_queue_id:
-                    client.update_routing_profile_default_outbound_queue(InstanceId=instance_id, RoutingProfileId=existing["Id"], DefaultOutboundQueueId=default_queue_id)
-                if rp.get("mediaConcurrencies"):
-                    client.update_routing_profile_concurrency(InstanceId=instance_id, RoutingProfileId=existing["Id"], MediaConcurrencies=rp["mediaConcurrencies"])
+                if rp.get("description") is not None or name:
+                    client.update_routing_profile_name(InstanceId=instance_id, RoutingProfileId=existing["Id"], Name=name, Description=rp.get("description"))
+                if target_def_q:
+                    client.update_routing_profile_default_outbound_queue(InstanceId=instance_id, RoutingProfileId=existing["Id"], DefaultOutboundQueueId=target_def_q)
+                mcs = rp.get("mediaConcurrencies")
+                if mcs:
+                    client.update_routing_profile_concurrency(InstanceId=instance_id, RoutingProfileId=existing["Id"], MediaConcurrencies=mcs)
                 inc("updatedRoutingProfiles")
             except (ClientError, ParamValidationError) as e:
                 if not continue_on_error:
@@ -869,24 +1140,16 @@ def import_bundle(
             if dry_run:
                 inc("createdRoutingProfiles")
                 continue
-            if not default_queue_id:
-                # Use first available queue
-                for eq in existing_queues.values():
-                    if eq.get("Id"):
-                        default_queue_id = eq["Id"]
-                        break
-            if not default_queue_id:
-                if continue_on_error:
-                    inc("failedRoutingProfiles")
-                    add_error("routingProfiles", {"name": name, "action": "create", "error": "No default outbound queue available"})
-                    continue
-                raise ValueError(f"Routing profile {name}: no default outbound queue available")
             try:
+                if not target_def_q:
+                    print(f"WARN: skipping routing profile {name}: no default outbound queue", file=sys.stderr)
+                    inc("skippedRoutingProfiles")
+                    continue
                 resp = client.create_routing_profile(**_drop_none({
                     "InstanceId": instance_id,
                     "Name": name,
                     "Description": rp.get("description"),
-                    "DefaultOutboundQueueId": default_queue_id,
+                    "DefaultOutboundQueueId": target_def_q,
                     "MediaConcurrencies": rp.get("mediaConcurrencies") or [{"Channel": "VOICE", "Concurrency": 1}],
                     "Tags": rp.get("tags"),
                 }))
@@ -912,23 +1175,17 @@ def import_bundle(
         name = qc.get("name")
         if not name:
             continue
-        cfg = qc.get("quickConnectConfig") or {}
-        qc_type = cfg.get("QuickConnectType")
-
-        # Skip user-type quick connects (require user replication)
+        qc_config = qc.get("quickConnectConfig") or {}
+        qc_type = qc_config.get("QuickConnectType")
         if qc_type == "USER":
-            inc("skippedQuickConnectsUser")
+            inc("skippedQuickConnects")
             continue
-
         existing = existing_quick_connects.get(name)
 
-        # Rewrite queue references in config
-        if qc_type == "QUEUE" and cfg.get("QueueConfig", {}).get("QueueId"):
-            orig_queue_id = cfg["QueueConfig"]["QueueId"]
-            for src, dst in replacements:
-                if src == orig_queue_id:
-                    cfg["QueueConfig"]["QueueId"] = dst
-                    break
+        # Rewrite IDs in config
+        config_str = json.dumps(qc_config)
+        config_str = _apply_replacements(config_str, replacements)
+        qc_config = json.loads(config_str)
 
         if existing and existing.get("Id"):
             add_repl(qc.get("id"), existing["Id"], qc.get("arn"), existing.get("Arn"))
@@ -939,8 +1196,8 @@ def import_bundle(
                 inc("updatedQuickConnects")
                 continue
             try:
-                client.update_quick_connect_config(InstanceId=instance_id, QuickConnectId=existing["Id"], QuickConnectConfig=cfg)
-                if qc.get("name"):
+                client.update_quick_connect_config(InstanceId=instance_id, QuickConnectId=existing["Id"], QuickConnectConfig=qc_config)
+                if qc.get("description") is not None or name:
                     client.update_quick_connect_name(InstanceId=instance_id, QuickConnectId=existing["Id"], Name=name, Description=qc.get("description"))
                 inc("updatedQuickConnects")
             except (ClientError, ParamValidationError) as e:
@@ -957,7 +1214,7 @@ def import_bundle(
                     "InstanceId": instance_id,
                     "Name": name,
                     "Description": qc.get("description"),
-                    "QuickConnectConfig": cfg,
+                    "QuickConnectConfig": qc_config,
                     "Tags": qc.get("tags"),
                 }))
                 inc("createdQuickConnects")
@@ -983,13 +1240,13 @@ def import_bundle(
         if not name:
             continue
         content = m.get("content") or ""
-
         if skip_unsupported:
             reasons = _unsupported_reasons(content)
             if reasons:
-                inc("skippedUnsupportedModules")
+                print(f"WARN: skipping module {name}: unsupported deps {reasons}", file=sys.stderr)
+                inc("skippedModules")
                 continue
-
+        content = _apply_replacements(content, replacements)
         existing = existing_modules.get(name)
 
         if existing and existing.get("Id"):
@@ -1001,8 +1258,7 @@ def import_bundle(
                 inc("updatedModules")
                 continue
             try:
-                new_content = _apply_replacements(content, replacements)
-                client.update_contact_flow_module_content(InstanceId=instance_id, ContactFlowModuleId=existing["Id"], Content=new_content)
+                client.update_contact_flow_module_content(InstanceId=instance_id, ContactFlowModuleId=existing["Id"], Content=content)
                 inc("updatedModules")
             except (ClientError, ParamValidationError) as e:
                 if not continue_on_error:
@@ -1014,12 +1270,11 @@ def import_bundle(
                 inc("createdModules")
                 continue
             try:
-                new_content = _apply_replacements(content, replacements)
                 resp = client.create_contact_flow_module(**_drop_none({
                     "InstanceId": instance_id,
                     "Name": name,
                     "Description": m.get("description"),
-                    "Content": new_content,
+                    "Content": content,
                     "Tags": m.get("tags"),
                 }))
                 inc("createdModules")
@@ -1032,7 +1287,7 @@ def import_bundle(
                 add_error("modules", {"name": name, "action": "create", "error": str(e)})
 
     # -------------------------------------------------------------------------
-    # 9. Contact Flows
+    # 9. Contact Flows (two-pass)
     # -------------------------------------------------------------------------
     existing_flows: Dict[str, Dict[str, Any]] = {}
     for page in _paginate(client.list_contact_flows, InstanceId=instance_id, ContactFlowTypes=CONTACT_FLOW_TYPES, MaxResults=100):
@@ -1041,12 +1296,16 @@ def import_bundle(
                 key = f"{f['ContactFlowType']}|{f['Name']}"
                 existing_flows[key] = f
 
-    # Pre-populate replacements for existing flows (for cross-flow refs)
-    for src_flow in bundle.get("contactFlows") or []:
-        key = f"{src_flow.get('type')}|{src_flow.get('name')}"
+    # Pre-map existing flows for cross-flow reference rewriting
+    for f in bundle.get("contactFlows") or []:
+        name = f.get("name")
+        flow_type = f.get("type")
+        if not name or not flow_type:
+            continue
+        key = f"{flow_type}|{name}"
         existing = existing_flows.get(key)
-        if existing and existing.get("Id"):
-            add_repl(src_flow.get("id"), existing["Id"], src_flow.get("arn"), existing.get("Arn"))
+        if existing:
+            add_repl(f.get("id"), existing.get("Id"), f.get("arn"), existing.get("Arn"))
 
     second_pass_flows: List[Tuple[Dict[str, Any], str]] = []
 
@@ -1056,16 +1315,15 @@ def import_bundle(
         if not name or not flow_type:
             continue
         content = f.get("content") or ""
-        key = f"{flow_type}|{name}"
-
         if skip_unsupported:
             reasons = _unsupported_reasons(content)
             if reasons:
-                inc("skippedUnsupportedFlows")
+                print(f"WARN: skipping flow {name} ({flow_type}): unsupported deps {reasons}", file=sys.stderr)
+                inc("skippedFlows")
                 continue
-
+        content = _apply_replacements(content, replacements)
+        key = f"{flow_type}|{name}"
         existing = existing_flows.get(key)
-        new_content = _apply_replacements(content, replacements)
 
         if existing and existing.get("Id"):
             if not overwrite:
@@ -1075,7 +1333,7 @@ def import_bundle(
                 inc("updatedFlows")
                 continue
             try:
-                client.update_contact_flow_content(InstanceId=instance_id, ContactFlowId=existing["Id"], Content=new_content)
+                client.update_contact_flow_content(InstanceId=instance_id, ContactFlowId=existing["Id"], Content=content)
                 inc("updatedFlows")
                 second_pass_flows.append((f, existing["Id"]))
             except (ClientError, ParamValidationError) as e:
@@ -1093,7 +1351,7 @@ def import_bundle(
                     "Name": name,
                     "Type": flow_type,
                     "Description": f.get("description"),
-                    "Content": new_content,
+                    "Content": content,
                     "Tags": f.get("tags"),
                 }))
                 inc("createdFlows")
@@ -1122,7 +1380,7 @@ def import_bundle(
                 add_error("flows", {"name": src_flow.get("name"), "type": src_flow.get("type"), "action": "secondPassUpdate", "error": str(e)})
 
     # -------------------------------------------------------------------------
-    # 10. Instance Attributes (optional sync)
+    # 10. Instance Attributes
     # -------------------------------------------------------------------------
     for attr in bundle.get("instanceAttributes") or []:
         attr_type = attr.get("attributeType")
@@ -1141,6 +1399,420 @@ def import_bundle(
             inc("failedInstanceAttributes")
             add_error("instanceAttributes", {"attributeType": attr_type, "error": str(e)})
 
+    # -------------------------------------------------------------------------
+    # 11. Predefined Attributes (V3)
+    # -------------------------------------------------------------------------
+    if version >= 3:
+        existing_predefined: Dict[str, Dict[str, Any]] = {}
+        try:
+            for page in _paginate(client.list_predefined_attributes, InstanceId=instance_id, MaxResults=100):
+                for pa in page.get("PredefinedAttributeSummaryList") or []:
+                    if pa.get("Name"):
+                        existing_predefined[pa["Name"]] = pa
+        except ClientError:
+            pass
+
+        for pa in bundle.get("predefinedAttributes") or []:
+            name = pa.get("name")
+            if not name:
+                continue
+            existing = existing_predefined.get(name)
+            values = pa.get("values")
+
+            if existing:
+                if not overwrite:
+                    inc("skippedPredefinedAttributes")
+                    continue
+                if dry_run:
+                    inc("updatedPredefinedAttributes")
+                    continue
+                try:
+                    client.update_predefined_attribute(InstanceId=instance_id, Name=name, Values=values)
+                    inc("updatedPredefinedAttributes")
+                except (ClientError, ParamValidationError) as e:
+                    if not continue_on_error:
+                        raise
+                    inc("failedPredefinedAttributes")
+                    add_error("predefinedAttributes", {"name": name, "action": "update", "error": str(e)})
+            else:
+                if dry_run:
+                    inc("createdPredefinedAttributes")
+                    continue
+                try:
+                    client.create_predefined_attribute(**_drop_none({
+                        "InstanceId": instance_id,
+                        "Name": name,
+                        "Values": values,
+                    }))
+                    inc("createdPredefinedAttributes")
+                except (ClientError, ParamValidationError) as e:
+                    if not continue_on_error:
+                        raise
+                    inc("failedPredefinedAttributes")
+                    add_error("predefinedAttributes", {"name": name, "action": "create", "error": str(e)})
+
+    # -------------------------------------------------------------------------
+    # 12. Prompts (V3) - requires S3 bucket for audio copy
+    # -------------------------------------------------------------------------
+    if version >= 3 and prompt_s3_bucket:
+        existing_prompts: Dict[str, Dict[str, Any]] = {}
+        try:
+            for page in _paginate(client.list_prompts, InstanceId=instance_id, MaxResults=100):
+                for ps in page.get("PromptSummaryList") or []:
+                    if ps.get("Name"):
+                        existing_prompts[ps["Name"]] = ps
+        except ClientError:
+            pass
+
+        for pr in bundle.get("prompts") or []:
+            name = pr.get("name")
+            s3_uri = pr.get("s3Uri")
+            if not name or not s3_uri:
+                continue
+            existing = existing_prompts.get(name)
+
+            if existing and existing.get("Id"):
+                add_repl(pr.get("id"), existing["Id"], pr.get("arn"), existing.get("Arn"))
+                inc("skippedPrompts")  # Can't update prompt audio
+                continue
+
+            if dry_run:
+                inc("createdPrompts")
+                continue
+            try:
+                # Copy S3 file
+                target_key = f"connect-prompts/{instance_id}/{name}.wav"
+                new_s3_uri = _copy_s3_prompt(s3_client, s3_uri, prompt_s3_bucket, target_key)
+                resp = client.create_prompt(**_drop_none({
+                    "InstanceId": instance_id,
+                    "Name": name,
+                    "Description": pr.get("description"),
+                    "S3Uri": new_s3_uri,
+                    "Tags": pr.get("tags"),
+                }))
+                inc("createdPrompts")
+                add_repl(pr.get("id"), resp.get("PromptId"), pr.get("arn"), resp.get("PromptARN"))
+            except (ClientError, ParamValidationError) as e:
+                if not continue_on_error:
+                    raise
+                inc("failedPrompts")
+                add_error("prompts", {"name": name, "action": "create", "error": str(e)})
+
+    # -------------------------------------------------------------------------
+    # 13. Task Templates (V3)
+    # -------------------------------------------------------------------------
+    if version >= 3:
+        existing_task_templates: Dict[str, Dict[str, Any]] = {}
+        try:
+            for page in _paginate(client.list_task_templates, InstanceId=instance_id, MaxResults=100):
+                for tt in page.get("TaskTemplates") or []:
+                    if tt.get("Name"):
+                        existing_task_templates[tt["Name"]] = tt
+        except ClientError:
+            pass
+
+        for tt in bundle.get("taskTemplates") or []:
+            name = tt.get("name")
+            if not name:
+                continue
+            existing = existing_task_templates.get(name)
+
+            # Rewrite flow IDs in contactFlowId
+            cf_id = tt.get("contactFlowId")
+            if cf_id:
+                cf_id = _apply_replacements(cf_id, replacements)
+
+            fields = tt.get("fields")
+            if fields:
+                fields_str = json.dumps(fields)
+                fields_str = _apply_replacements(fields_str, replacements)
+                fields = json.loads(fields_str)
+
+            if existing and existing.get("Id"):
+                add_repl(tt.get("id"), existing["Id"], tt.get("arn"), existing.get("Arn"))
+                if not overwrite:
+                    inc("skippedTaskTemplates")
+                    continue
+                if dry_run:
+                    inc("updatedTaskTemplates")
+                    continue
+                try:
+                    client.update_task_template(**_drop_none({
+                        "InstanceId": instance_id,
+                        "TaskTemplateId": existing["Id"],
+                        "Name": name,
+                        "Description": tt.get("description"),
+                        "Fields": fields,
+                        "Defaults": tt.get("defaults"),
+                        "Constraints": tt.get("constraints"),
+                        "ContactFlowId": cf_id,
+                        "Status": tt.get("status"),
+                    }))
+                    inc("updatedTaskTemplates")
+                except (ClientError, ParamValidationError) as e:
+                    if not continue_on_error:
+                        raise
+                    inc("failedTaskTemplates")
+                    add_error("taskTemplates", {"name": name, "action": "update", "error": str(e)})
+            else:
+                if dry_run:
+                    inc("createdTaskTemplates")
+                    continue
+                try:
+                    resp = client.create_task_template(**_drop_none({
+                        "InstanceId": instance_id,
+                        "Name": name,
+                        "Description": tt.get("description"),
+                        "Fields": fields,
+                        "Defaults": tt.get("defaults"),
+                        "Constraints": tt.get("constraints"),
+                        "ContactFlowId": cf_id,
+                        "Status": tt.get("status") or "ACTIVE",
+                    }))
+                    inc("createdTaskTemplates")
+                    add_repl(tt.get("id"), resp.get("Id"), tt.get("arn"), resp.get("Arn"))
+                except (ClientError, ParamValidationError) as e:
+                    if not continue_on_error:
+                        raise
+                    inc("failedTaskTemplates")
+                    add_error("taskTemplates", {"name": name, "action": "create", "error": str(e)})
+
+    # -------------------------------------------------------------------------
+    # 14. Views (V3)
+    # -------------------------------------------------------------------------
+    if version >= 3:
+        existing_views: Dict[str, Dict[str, Any]] = {}
+        try:
+            for page in _paginate(client.list_views, InstanceId=instance_id, MaxResults=100):
+                for vs in page.get("ViewsSummaryList") or []:
+                    if vs.get("Name"):
+                        existing_views[vs["Name"]] = vs
+        except ClientError:
+            pass
+
+        for v in bundle.get("views") or []:
+            name = v.get("name")
+            if not name:
+                continue
+            existing = existing_views.get(name)
+            content = v.get("content")
+            if content:
+                content_str = json.dumps(content) if isinstance(content, dict) else str(content)
+                content_str = _apply_replacements(content_str, replacements)
+                content = json.loads(content_str) if content_str.startswith("{") else content_str
+
+            if existing and existing.get("Id"):
+                add_repl(v.get("id"), existing["Id"], v.get("arn"), existing.get("Arn"))
+                if not overwrite:
+                    inc("skippedViews")
+                    continue
+                if dry_run:
+                    inc("updatedViews")
+                    continue
+                try:
+                    client.update_view_content(**_drop_none({
+                        "InstanceId": instance_id,
+                        "ViewId": existing["Id"],
+                        "Content": content,
+                        "Status": v.get("status") or "PUBLISHED",
+                    }))
+                    inc("updatedViews")
+                except (ClientError, ParamValidationError) as e:
+                    if not continue_on_error:
+                        raise
+                    inc("failedViews")
+                    add_error("views", {"name": name, "action": "update", "error": str(e)})
+            else:
+                if dry_run:
+                    inc("createdViews")
+                    continue
+                try:
+                    resp = client.create_view(**_drop_none({
+                        "InstanceId": instance_id,
+                        "Name": name,
+                        "Description": v.get("description"),
+                        "Content": content,
+                        "Status": v.get("status") or "PUBLISHED",
+                        "Tags": v.get("tags"),
+                    }))
+                    inc("createdViews")
+                    view_resp = resp.get("View") or {}
+                    add_repl(v.get("id"), view_resp.get("Id"), v.get("arn"), view_resp.get("Arn"))
+                except (ClientError, ParamValidationError) as e:
+                    if not continue_on_error:
+                        raise
+                    inc("failedViews")
+                    add_error("views", {"name": name, "action": "create", "error": str(e)})
+
+    # -------------------------------------------------------------------------
+    # 15. Rules (V3)
+    # -------------------------------------------------------------------------
+    if version >= 3:
+        existing_rules: Dict[str, Dict[str, Any]] = {}
+        try:
+            for page in _paginate(client.list_rules, InstanceId=instance_id, MaxResults=100, PublishStatus="PUBLISHED"):
+                for rs in page.get("RuleSummaryList") or []:
+                    if rs.get("Name"):
+                        existing_rules[rs["Name"]] = rs
+        except ClientError:
+            pass
+
+        for r in bundle.get("rules") or []:
+            name = r.get("name")
+            if not name:
+                continue
+            existing = existing_rules.get(name)
+
+            # Rewrite IDs in actions
+            actions = r.get("actions")
+            if actions:
+                actions_str = json.dumps(actions)
+                actions_str = _apply_replacements(actions_str, replacements)
+                actions = json.loads(actions_str)
+
+            trigger = r.get("triggerEventSource")
+            if trigger:
+                trigger_str = json.dumps(trigger)
+                trigger_str = _apply_replacements(trigger_str, replacements)
+                trigger = json.loads(trigger_str)
+
+            func = r.get("function")
+            if func:
+                func = _apply_replacements(func, replacements)
+
+            if existing and existing.get("RuleId"):
+                add_repl(r.get("id"), existing["RuleId"], r.get("arn"), existing.get("RuleArn"))
+                if not overwrite:
+                    inc("skippedRules")
+                    continue
+                if dry_run:
+                    inc("updatedRules")
+                    continue
+                try:
+                    client.update_rule(**_drop_none({
+                        "InstanceId": instance_id,
+                        "RuleId": existing["RuleId"],
+                        "Name": name,
+                        "Function": func,
+                        "Actions": actions,
+                        "PublishStatus": r.get("publishStatus") or "PUBLISHED",
+                    }))
+                    inc("updatedRules")
+                except (ClientError, ParamValidationError) as e:
+                    if not continue_on_error:
+                        raise
+                    inc("failedRules")
+                    add_error("rules", {"name": name, "action": "update", "error": str(e)})
+            else:
+                if dry_run:
+                    inc("createdRules")
+                    continue
+                try:
+                    resp = client.create_rule(**_drop_none({
+                        "InstanceId": instance_id,
+                        "Name": name,
+                        "Function": func,
+                        "Actions": actions or [],
+                        "TriggerEventSource": trigger,
+                        "PublishStatus": r.get("publishStatus") or "PUBLISHED",
+                    }))
+                    inc("createdRules")
+                    add_repl(r.get("id"), resp.get("RuleId"), r.get("arn"), resp.get("RuleArn"))
+                except (ClientError, ParamValidationError) as e:
+                    if not continue_on_error:
+                        raise
+                    inc("failedRules")
+                    add_error("rules", {"name": name, "action": "create", "error": str(e)})
+
+    # -------------------------------------------------------------------------
+    # 16. Evaluation Forms (V3)
+    # -------------------------------------------------------------------------
+    if version >= 3:
+        existing_eval_forms: Dict[str, Dict[str, Any]] = {}
+        try:
+            for page in _paginate(client.list_evaluation_forms, InstanceId=instance_id, MaxResults=100):
+                for ef in page.get("EvaluationFormSummaryList") or []:
+                    if ef.get("Title"):
+                        existing_eval_forms[ef["Title"]] = ef
+        except ClientError:
+            pass
+
+        for ef in bundle.get("evaluationForms") or []:
+            title = ef.get("title")
+            if not title:
+                continue
+            existing = existing_eval_forms.get(title)
+            items = ef.get("items")
+
+            if existing and existing.get("EvaluationFormId"):
+                add_repl(ef.get("id"), existing["EvaluationFormId"], ef.get("arn"), existing.get("EvaluationFormArn"))
+                inc("skippedEvaluationForms")  # Eval forms require versioning for updates
+                continue
+
+            if dry_run:
+                inc("createdEvaluationForms")
+                continue
+            try:
+                resp = client.create_evaluation_form(**_drop_none({
+                    "InstanceId": instance_id,
+                    "Title": title,
+                    "Description": ef.get("description"),
+                    "Items": items or [],
+                    "ScoringStrategy": ef.get("scoringStrategy"),
+                }))
+                inc("createdEvaluationForms")
+                add_repl(ef.get("id"), resp.get("EvaluationFormId"), ef.get("arn"), resp.get("EvaluationFormArn"))
+            except (ClientError, ParamValidationError) as e:
+                if not continue_on_error:
+                    raise
+                inc("failedEvaluationForms")
+                add_error("evaluationForms", {"title": title, "action": "create", "error": str(e)})
+
+    # -------------------------------------------------------------------------
+    # 17. Vocabularies (V3)
+    # -------------------------------------------------------------------------
+    if version >= 3:
+        existing_vocabs: Dict[str, Dict[str, Any]] = {}
+        try:
+            for page in _paginate(client.search_vocabularies, InstanceId=instance_id, MaxResults=100):
+                for vs in page.get("VocabularySummaryList") or []:
+                    if vs.get("Name"):
+                        existing_vocabs[vs["Name"]] = vs
+        except ClientError:
+            pass
+
+        for voc in bundle.get("vocabularies") or []:
+            name = voc.get("name")
+            lang = voc.get("languageCode")
+            content = voc.get("content")
+            if not name or not lang:
+                continue
+            existing = existing_vocabs.get(name)
+
+            if existing and existing.get("Id"):
+                add_repl(voc.get("id"), existing["Id"], voc.get("arn"), existing.get("Arn"))
+                inc("skippedVocabularies")  # Can't update vocabulary content
+                continue
+
+            if dry_run:
+                inc("createdVocabularies")
+                continue
+            try:
+                resp = client.create_vocabulary(**_drop_none({
+                    "InstanceId": instance_id,
+                    "VocabularyName": name,
+                    "LanguageCode": lang,
+                    "Content": content,
+                    "Tags": voc.get("tags"),
+                }))
+                inc("createdVocabularies")
+                add_repl(voc.get("id"), resp.get("VocabularyId"), voc.get("arn"), resp.get("VocabularyArn"))
+            except (ClientError, ParamValidationError) as e:
+                if not continue_on_error:
+                    raise
+                inc("failedVocabularies")
+                add_error("vocabularies", {"name": name, "action": "create", "error": str(e)})
+
     return {
         **stats,
         "errors": errors,
@@ -1157,13 +1829,13 @@ def import_bundle(
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Best-effort Amazon Connect exporter/importer using primitive Connect APIs (v2: hours, agent statuses, security profiles, hierarchy groups, queues, routing profiles, quick connects, modules, flows)."
+        description="Best-effort Amazon Connect exporter/importer using primitive Connect APIs (v3: hours, agent statuses, security profiles, hierarchy groups, queues, routing profiles, quick connects, modules, flows, predefined attrs, prompts, task templates, views, rules, eval forms, vocabularies)."
     )
     p.add_argument("--profile", default=None, help="AWS credential profile name (optional)")
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    exp = sub.add_parser("export", help="Export a bundle (v2)")
+    exp = sub.add_parser("export", help="Export a bundle (v3)")
     exp.add_argument("--region", required=True)
     exp.add_argument("--instance-id", required=True)
     exp.add_argument("--out", required=False, default="-", help="Output file path, or '-' for stdout")
@@ -1176,6 +1848,7 @@ def build_parser() -> argparse.ArgumentParser:
     imp.add_argument("--dry-run", action="store_true", help="Print what would happen, but do not call Create/Update")
     imp.add_argument("--continue-on-error", action="store_true", help="Continue importing after errors")
     imp.add_argument("--skip-unsupported", action="store_true", help="Skip flows/modules with external deps")
+    imp.add_argument("--prompt-s3-bucket", default=None, help="S3 bucket in target region for prompt audio files")
 
     return p
 
@@ -1207,6 +1880,7 @@ def main(argv: List[str]) -> int:
                 dry_run=args.dry_run,
                 continue_on_error=args.continue_on_error,
                 skip_unsupported=args.skip_unsupported,
+                prompt_s3_bucket=getattr(args, "prompt_s3_bucket", None),
             )
             print(json.dumps(out, indent=2))
             return 0
