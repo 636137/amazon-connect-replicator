@@ -62,7 +62,25 @@ export type ExportedQueue = {
   tags?: Record<string, string>;
 };
 
-// Resource type keys for v3 bundle
+export type ExportedLambdaFunction = {
+  arn: string;
+  region?: string;
+  accountId?: string;
+  functionName?: string;
+};
+
+export type ExportedLexBot = {
+  aliasArn?: string;
+  name?: string;
+  lexVersion: "V1" | "V2";
+  region?: string;
+  accountId?: string;
+  botAliasId?: string;
+  botName?: string;
+  lexRegion?: string;
+};
+
+// Resource type keys for v3.1 bundle (19 resource types)
 export type ResourceType =
   | "hoursOfOperations"
   | "agentStatuses"
@@ -80,7 +98,9 @@ export type ResourceType =
   | "views"
   | "rules"
   | "evaluationForms"
-  | "vocabularies";
+  | "vocabularies"
+  | "lambdaFunctions"
+  | "lexBots";
 
 export const RESOURCE_TYPES: { key: ResourceType; label: string; description: string }[] = [
   { key: "hoursOfOperations", label: "Hours of Operation", description: "Business hours schedules" },
@@ -100,6 +120,8 @@ export const RESOURCE_TYPES: { key: ResourceType; label: string; description: st
   { key: "rules", label: "Rules", description: "Contact Lens rules" },
   { key: "evaluationForms", label: "Evaluation Forms", description: "QA scoring forms" },
   { key: "vocabularies", label: "Vocabularies", description: "Custom vocabularies" },
+  { key: "lambdaFunctions", label: "Lambda Functions", description: "AWS Lambda integrations (ARNs auto-replaced)" },
+  { key: "lexBots", label: "Lex Bots", description: "Amazon Lex V1/V2 bots (ARNs auto-replaced)" },
 ];
 
 export type ExportBundleV1 = {
@@ -123,4 +145,6 @@ export type ExportBundleV1 = {
   rules?: any[];
   evaluationForms?: any[];
   vocabularies?: any[];
+  lambdaFunctions?: ExportedLambdaFunction[];
+  lexBots?: ExportedLexBot[];
 };
