@@ -7,11 +7,9 @@ import random
 import string
 import subprocess
 import sys
-import time
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 import boto3
 from botocore.exceptions import ClientError
@@ -146,62 +144,6 @@ def resolve_instance_id(*, profile: Optional[str], region: str, instance_id: Opt
     raise ValueError(f"No instance found in {region} with alias '{alias}'. Known aliases (first 25): {known}")
 
 
-@dataclass
-class CreatedInstance:
-    instance_id: str
-    instance_arn: Optional[str]
-    alias: str
-
-
-def create_instance(
-    *,
-    profile: Optional[str],
-    region: str,
-    alias: str,
-    identity_management_type: str = "CONNECT_MANAGED",
-    inbound_calls_enabled: bool = False,
-    outbound_calls_enabled: bool = False,
-) -> CreatedInstance:
-    client = _connect_client(profile, region)
-
-    resp = client.create_instance(
-        InstanceAlias=alias,
-        IdentityManagementType=identity_management_type,
-        InboundCallsEnabled=inbound_calls_enabled,
-        OutboundCallsEnabled=outbound_calls_enabled,
-    )
-
-    iid = resp.get("Id")
-    arn = resp.get("Arn")
-    if not iid:
-        raise RuntimeError(f"create_instance did not return Id (resp keys: {list(resp.keys())})")
-
-    return CreatedInstance(instance_id=str(iid), instance_arn=str(arn) if arn else None, alias=alias)
-
-
-def wait_for_instance_active(*, profile: Optional[str], region: str, instance_id: str, timeout_s: int = 900) -> Dict[str, Any]:
-    client = _connect_client(profile, region)
-    deadline = time.time() + timeout_s
-    last_status = None
-
-    while time.time() < deadline:
-        resp = client.describe_instance(InstanceId=instance_id)
-        inst = resp.get("Instance") or {}
-        status = inst.get("InstanceStatus")
-        if status != last_status:
-            print(f"Instance status: {status}")
-            last_status = status
-
-        if status == "ACTIVE":
-            return inst
-        if status in ("CREATION_FAILED", "DELETION_FAILED"):
-            raise RuntimeError(f"Instance entered failure state: {status}")
-
-        time.sleep(10)
-
-    raise TimeoutError(f"Timed out waiting for instance {instance_id} to become ACTIVE")
-
-
 def verify_counts(*, profile: Optional[str], region: str, instance_id: str) -> Dict[str, int]:
     client = _connect_client(profile, region)
 
@@ -269,35 +211,13 @@ def cmd_replicate(args: argparse.Namespace) -> int:
         alias=args.source_alias,
     )
 
-    # Determine / create target
-    target_instance_id = None
-    created = None
-
-    if args.create_target:
-        if args.dry_run:
-            raise ValueError("Cannot use --create-target with --dry-run (instance creation is a live action)")
-        if not args.yes:
-            raise ValueError("Refusing to create a target instance without --yes")
-
-        target_alias = args.target_alias or ("acr-repl-" + _random_suffix(8))
-        created = create_instance(
-            profile=args.profile,
-            region=args.target_region,
-            alias=target_alias,
-            identity_management_type=args.identity_management_type,
-            inbound_calls_enabled=args.inbound_calls_enabled,
-            outbound_calls_enabled=args.outbound_calls_enabled,
-        )
-        print(f"Created target instance: alias={created.alias} id={created.instance_id}")
-        wait_for_instance_active(profile=args.profile, region=args.target_region, instance_id=created.instance_id)
-        target_instance_id = created.instance_id
-    else:
-        target_instance_id = resolve_instance_id(
-            profile=args.profile,
-            region=args.target_region,
-            instance_id=args.target_instance_id,
-            alias=args.target_alias,
-        )
+    # Resolve target instance (must already exist)
+    target_instance_id = resolve_instance_id(
+        profile=args.profile,
+        region=args.target_region,
+        instance_id=args.target_instance_id,
+        alias=args.target_alias,
+    )
 
     # Export
     export_args = ["--profile", args.profile] if args.profile else []
@@ -333,13 +253,6 @@ def cmd_replicate(args: argparse.Namespace) -> int:
         "target": {
             "region": args.target_region,
             "instanceId": target_instance_id,
-            "created": {
-                "alias": created.alias,
-                "id": created.instance_id,
-                "arn": created.instance_arn,
-            }
-            if created
-            else None,
         },
         "paths": {
             "bundle": str(bundle_path),
@@ -365,7 +278,7 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--region", required=True)
     d.set_defaults(func=cmd_discover)
 
-    r = sub.add_parser("replicate", help="Export from source, optionally create target, import into target, and verify counts")
+    r = sub.add_parser("replicate", help="Export from source, import into existing target, and verify counts")
 
     r.add_argument("--source-region", required=True)
     r.add_argument("--source-instance-id", default=None)
@@ -373,12 +286,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     r.add_argument("--target-region", required=True)
     r.add_argument("--target-instance-id", default=None)
-    r.add_argument("--target-alias", default=None, help="When --create-target, this is the new alias; otherwise, alias to resolve")
-
-    r.add_argument("--create-target", action="store_true", help="Create a brand new target instance in target region")
-    r.add_argument("--identity-management-type", default="CONNECT_MANAGED", choices=["CONNECT_MANAGED", "SAML", "EXISTING_DIRECTORY"])
-    r.add_argument("--inbound-calls-enabled", action="store_true")
-    r.add_argument("--outbound-calls-enabled", action="store_true")
+    r.add_argument("--target-alias", default=None, help="Alias of existing target instance to resolve")
 
     r.add_argument("--overwrite", action="store_true", help="Overwrite resources if they already exist in target")
     r.add_argument("--dry-run", action="store_true", help="Run importer in dry-run mode (no Create/Update)")
@@ -388,7 +296,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--workdir", default=None, help="Output directory for run artifacts")
     r.add_argument("--run-id", default=None, help="Override runId used for default workdir naming")
 
-    r.add_argument("--yes", action="store_true", help="Acknowledge live actions (create instance/import)")
+    r.add_argument("--yes", action="store_true", help="Acknowledge live actions (import into target)")
 
     r.set_defaults(func=cmd_replicate)
 

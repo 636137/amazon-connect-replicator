@@ -1,39 +1,57 @@
 ---
 name: connect-instance-replication
-description: "Replicate Amazon Connect instance configuration cross-region (hours, queues, contact flows + modules) using primitive Connect APIs (no Global Resiliency)."
+description: "Replicate Amazon Connect instance configuration cross-region using primitive Connect APIs (no Global Resiliency). Always updates a pre-existing target instance."
 user-invocable: true
 disable-model-invocation: false
 ---
 
 # Amazon Connect Instance Replication (Primitive APIs) Skill
 
-Use this skill to **replicate an Amazon Connect instance’s configuration** from a source region (e.g. `us-east-1`) into a target region (e.g. `us-west-2`) in minutes.
+Use this skill to **replicate an Amazon Connect instance's configuration** from a source region (e.g. `us-east-1`) into a **pre-existing** target instance in another region (e.g. `us-west-2`) in minutes.
 
 This is **best-effort configuration replication** using the suite of **primitive Amazon Connect APIs** (List/Describe/Create/Update). It is **not** Amazon Connect Global Resiliency.
 
-## What this skill replicates (bundle v1)
+## Design Philosophy: Pre-Existing Target Instance
 
-- Hours of operation
-- Queues (STANDARD)
-- Contact flow modules
-- Contact flows
+This skill **always replicates into a pre-existing target instance**. It does **not** create new instances on-the-fly.
+
+**Why?** Enterprises need predictable instance IDs for:
+- CloudWatch alarms and dashboards
+- Cost allocation tags and billing
+- IAM policies scoped to specific instance ARNs
+- Integration endpoints (Lambda, Lex, Kinesis)
+- Compliance/audit trails
+
+Provision your target instance in advance (via Console, CLI, or IaC), then use this skill to sync configuration.
+
+## What this skill replicates (bundle v2)
+
+1. **Hours of Operation**
+2. **Agent Statuses** (custom availability states)
+3. **Security Profiles** (permissions)
+4. **User Hierarchy Groups** (org structure)
+5. **Queues** (STANDARD)
+6. **Routing Profiles** (skill-based routing)
+7. **Quick Connects** (queue + phone types; user-type skipped)
+8. **Contact Flow Modules**
+9. **Contact Flows**
+10. **Instance Attributes** (feature flags like Contact Lens, flow logs)
 
 Import order is dependency-aware:
-1) Hours → 2) Queues → 3) Modules → 4) Flows
+Hours → Agent Statuses → Security Profiles → Hierarchy Groups → Queues → Routing Profiles → Quick Connects → Modules → Flows → Instance Attributes
 
 ## What this does NOT replicate (by design)
 
-- Phone numbers / telephony claims
-- Users, security profiles, routing profiles
-- Quick connects
-- Prompts / audio assets
-- Lex bots, Lambda functions, S3 assets, or other external dependencies referenced by flows
+- Phone numbers / telephony claims (region-specific)
+- Users (require identity provider setup)
+- Prompts / audio assets (require S3 migration)
+- Lex bots, Lambda functions, S3 assets (must exist in target region)
 
 ## Safety rules
 
-- Live creation/import actions require an explicit `--yes` acknowledgement.
+- Live import actions require an explicit `--yes` acknowledgement.
 - Prefer `--dry-run` first to validate mapping and scope.
-- Prefer `--skip-unsupported` to keep runs fast when flows reference external assets.
+- Prefer `--skip-unsupported` to skip flows with external dependencies.
 
 ## Prerequisites
 
@@ -65,23 +83,21 @@ python3 ~/.copilot/skills/connect-instance-replication/scripts/connect_instance_
   --region us-east-1
 ```
 
-### 2) Replicate source → brand new target instance
-
-This is the fastest “from scratch in the other region” path.
+### 2) Replicate into an existing target instance
 
 ```bash
 python3 ~/.copilot/skills/connect-instance-replication/scripts/connect_instance_replication.py replicate \
   --source-region us-east-1 \
-  --source-alias YOUR_SOURCE_ALIAS \
+  --source-alias my-prod-connect \
   --target-region us-west-2 \
-  --create-target \
-  --target-alias acr-repl-demo-001 \
+  --target-alias my-dr-connect \
+  --overwrite \
   --skip-unsupported \
   --continue-on-error \
   --yes
 ```
 
-### 3) Replicate into an existing target instance
+### 3) Replicate using instance IDs
 
 ```bash
 python3 ~/.copilot/skills/connect-instance-replication/scripts/connect_instance_replication.py replicate \
@@ -96,8 +112,6 @@ python3 ~/.copilot/skills/connect-instance-replication/scripts/connect_instance_
 ```
 
 ### 4) Dry-run import (no Create/Update calls)
-
-Note: `--dry-run` cannot be combined with `--create-target` (creating an instance is always a live action).
 
 ```bash
 python3 ~/.copilot/skills/connect-instance-replication/scripts/connect_instance_replication.py replicate \
