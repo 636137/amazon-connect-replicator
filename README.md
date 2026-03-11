@@ -8,6 +8,7 @@ This repo is intentionally scoped to what Connect exposes as CRUD-style APIs; it
 - `packages/api`: Express API that calls the Connect APIs
 - `packages/ui`: React UI wizard to pick regions/instances, export a bundle, and import it
 - `tools/connect-instance-replicator`: Python CLI (boto3) to export/import bundles (useful for automation and live testing)
+- `copilot-skills/connect-instance-replication`: a vendored **Copilot Skill** (plus helper script) to run replication on-demand from your terminal
 
 ## Supported resources (bundle v1)
 Export (source) → import (target):
@@ -54,6 +55,168 @@ npm run dev
 
 ## Python CLI (recommended for automation)
 See: [`tools/connect-instance-replicator/README.md`](tools/connect-instance-replicator/README.md)
+
+## Copilot Skill: connect-instance-replication (run on demand)
+
+This repo vendors a Copilot skill you can install into your local Copilot CLI so you can run:
+
+- instance discovery (list instances by region)
+- export → (optional) create target instance → import → verify counts
+
+…with the same proven importer hardening (omit nils, longest-first replacements, two-pass flow rewrites).
+
+### Skill location in this repo
+
+- `copilot-skills/connect-instance-replication/SKILL.md`
+- `copilot-skills/connect-instance-replication/scripts/connect_instance_replication.py`
+
+### Install the skill locally
+
+1) Copy the skill folder into your Copilot skills directory:
+
+```bash
+mkdir -p ~/.copilot/skills
+cp -R ./copilot-skills/connect-instance-replication ~/.copilot/skills/connect-instance-replication
+```
+
+2) Install Python deps for the helper script:
+
+```bash
+pip3 install -r ~/.copilot/skills/connect-instance-replication/requirements.txt
+```
+
+### How the skill works
+
+The helper script is a thin wrapper around the repo’s replicator CLI:
+
+- `tools/connect-instance-replicator/connect_instance_replicate.py`
+
+It uses primitive Amazon Connect APIs (via boto3) to:
+
+1) resolve instance IDs (by alias) using `ListInstances`
+2) export a bundle from the source instance (hours/queues/modules/flows)
+3) optionally create a brand new target Connect instance in the target region
+4) import the bundle into the target instance (create/update)
+5) verify counts and write a small report set
+
+### Safety guardrails
+
+- Any live action that can change AWS state requires `--yes`.
+  - Creating a target instance (`--create-target`) requires `--yes`.
+  - Importing into a target instance (non-`--dry-run`) requires `--yes`.
+- `--dry-run` is supported for import (no Create/Update calls).
+- `--dry-run` cannot be combined with `--create-target` (instance creation is always live).
+
+### Where artifacts are written
+
+Each run writes a timestamped directory (by default):
+
+- `~/Downloads/acr-replication-runs/<runId>/`
+
+Containing:
+
+- `bundle.json` (exported configuration)
+- `import-report.json` (import results from the underlying replicator)
+- `verify.json` (post-import resource counts)
+
+The script prints a final JSON summary to stdout with the runId, artifact paths, and verification counts.
+
+### Usage examples
+
+#### 1) Discover instances in a region
+
+```bash
+python3 ~/.copilot/skills/connect-instance-replication/scripts/connect_instance_replication.py discover \
+  --region us-east-1
+```
+
+Expected result (shape):
+
+```json
+{
+  "region": "us-east-1",
+  "instances": [
+    {
+      "alias": "my-prod-connect",
+      "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "arn": "arn:aws:connect:us-east-1:123456789012:instance/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "status": "ACTIVE",
+      "created": "2026-03-01T12:34:56+00:00"
+    }
+  ]
+}
+```
+
+#### 2) Replicate `us-east-1` → **brand new** `us-west-2` instance
+
+This is the fastest “replicate into a fresh instance” path.
+
+```bash
+python3 ~/.copilot/skills/connect-instance-replication/scripts/connect_instance_replication.py replicate \
+  --source-region us-east-1 \
+  --source-alias my-prod-connect \
+  --target-region us-west-2 \
+  --create-target \
+  --target-alias acr-repl-demo-001 \
+  --skip-unsupported \
+  --continue-on-error \
+  --yes
+```
+
+Expected results:
+- A brand new Connect instance is created in `us-west-2` and the script waits for it to become `ACTIVE`.
+- A bundle is exported from the source instance.
+- The bundle is imported into the target instance.
+- A summary JSON is printed and artifacts are written to the run folder.
+
+Example summary output (shape):
+
+```json
+{
+  "runId": "20260311T190000Z-abc123",
+  "workdir": "/Users/you/Downloads/acr-replication-runs/20260311T190000Z-abc123",
+  "source": { "region": "us-east-1", "instanceId": "..." },
+  "target": { "region": "us-west-2", "instanceId": "...", "created": { "alias": "acr-repl-demo-001", "id": "...", "arn": "..." } },
+  "paths": {
+    "bundle": ".../bundle.json",
+    "importReport": ".../import-report.json",
+    "verify": ".../verify.json"
+  },
+  "verifyCounts": { "hours": 2, "queues": 6, "modules": 0, "flows": 21 }
+}
+```
+
+#### 3) Replicate into an existing target instance (overwrite)
+
+```bash
+python3 ~/.copilot/skills/connect-instance-replication/scripts/connect_instance_replication.py replicate \
+  --source-region us-east-1 \
+  --source-instance-id SOURCE_INSTANCE_ID \
+  --target-region us-west-2 \
+  --target-instance-id TARGET_INSTANCE_ID \
+  --overwrite \
+  --skip-unsupported \
+  --continue-on-error \
+  --yes
+```
+
+#### 4) Dry-run import (no Create/Update calls)
+
+```bash
+python3 ~/.copilot/skills/connect-instance-replication/scripts/connect_instance_replication.py replicate \
+  --source-region us-east-1 \
+  --source-instance-id SOURCE_INSTANCE_ID \
+  --target-region us-west-2 \
+  --target-instance-id TARGET_INSTANCE_ID \
+  --dry-run
+```
+
+### Environment variables
+
+If your repo is not in `~/amazon-connect-replicator`, set one of:
+
+- `ACR_REPO=/path/to/amazon-connect-replicator`
+- `ACR_REPLICATOR_SCRIPT=/full/path/to/connect_instance_replicate.py`
 
 ## Example: live us-east-1 → us-west-2 replication
 A live test was performed by exporting from a real `us-east-1` instance and importing into a newly created `us-west-2` instance.
