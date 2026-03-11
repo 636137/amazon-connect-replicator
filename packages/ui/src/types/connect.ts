@@ -39,10 +39,35 @@ export type ExportedContactFlow = {
   tags?: Record<string, string>;
 };
 
+export type ExportedHoursOfOperation = {
+  id?: string;
+  arn?: string;
+  name: string;
+  description?: string;
+  timeZone?: string;
+  config?: any;
+  tags?: Record<string, string>;
+};
+
+export type ExportedQueue = {
+  id?: string;
+  arn?: string;
+  name: string;
+  description?: string;
+  status?: string;
+  maxContacts?: number;
+  hoursOfOperationId?: string;
+  hoursOfOperationName?: string;
+  outboundCallerConfig?: any;
+  tags?: Record<string, string>;
+};
+
 export type ExportBundleV1 = {
   version: 1;
   exportedAt: string;
   source: { region: string; instanceId: string };
+  hoursOfOperations?: ExportedHoursOfOperation[];
+  queues?: ExportedQueue[];
   flowModules: ExportedFlowModule[];
   contactFlows: ExportedContactFlow[];
 };

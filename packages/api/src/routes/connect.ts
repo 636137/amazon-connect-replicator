@@ -2,14 +2,29 @@ import {
   ConnectClient,
   CreateContactFlowCommand,
   CreateContactFlowModuleCommand,
+  CreateHoursOfOperationCommand,
+  CreateQueueCommand,
   DescribeContactFlowCommand,
   DescribeContactFlowModuleCommand,
+  DescribeHoursOfOperationCommand,
   DescribeInstanceCommand,
+  DescribeQueueCommand,
   ListContactFlowModulesCommand,
+  ListContactFlowModulesCommandOutput,
   ListContactFlowsCommand,
+  ListContactFlowsCommandOutput,
+  ListHoursOfOperationsCommand,
+  ListHoursOfOperationsCommandOutput,
   ListInstancesCommand,
+  ListQueuesCommand,
+  ListQueuesCommandOutput,
   UpdateContactFlowContentCommand,
-  UpdateContactFlowModuleContentCommand
+  UpdateContactFlowModuleContentCommand,
+  UpdateHoursOfOperationCommand,
+  UpdateQueueHoursOfOperationCommand,
+  UpdateQueueMaxContactsCommand,
+  UpdateQueueOutboundCallerConfigCommand,
+  UpdateQueueStatusCommand
 } from "@aws-sdk/client-connect";
 import { Router } from "express";
 import { z } from "zod";
@@ -57,10 +72,35 @@ type ExportedContactFlow = {
   tags?: Record<string, string>;
 };
 
+type ExportedHoursOfOperation = {
+  id?: string;
+  arn?: string;
+  name: string;
+  description?: string;
+  timeZone?: string;
+  config?: any;
+  tags?: Record<string, string>;
+};
+
+type ExportedQueue = {
+  id?: string;
+  arn?: string;
+  name: string;
+  description?: string;
+  status?: string;
+  maxContacts?: number;
+  hoursOfOperationId?: string;
+  hoursOfOperationName?: string;
+  outboundCallerConfig?: any;
+  tags?: Record<string, string>;
+};
+
 type ExportBundleV1 = {
   version: 1;
   exportedAt: string;
   source: { region: string; instanceId: string };
+  hoursOfOperations?: ExportedHoursOfOperation[];
+  queues?: ExportedQueue[];
   flowModules: ExportedFlowModule[];
   contactFlows: ExportedContactFlow[];
 };
@@ -79,7 +119,7 @@ async function listAllContactFlowModules(region: string, instanceId: string) {
   const out: Array<{ Id?: string; Arn?: string; Name?: string; State?: string }> = [];
   let nextToken: string | undefined = undefined;
   do {
-    const page = await c.send(
+    const page: ListContactFlowModulesCommandOutput = await c.send(
       new ListContactFlowModulesCommand({
         InstanceId: instanceId,
         MaxResults: 100,
@@ -97,7 +137,7 @@ async function listAllContactFlows(region: string, instanceId: string) {
   const out: Array<{ Id?: string; Arn?: string; Name?: string; ContactFlowType?: string }> = [];
   let nextToken: string | undefined = undefined;
   do {
-    const page = await c.send(
+    const page: ListContactFlowsCommandOutput = await c.send(
       new ListContactFlowsCommand({
         InstanceId: instanceId,
         ContactFlowTypes: [...CONTACT_FLOW_TYPES],
@@ -106,6 +146,42 @@ async function listAllContactFlows(region: string, instanceId: string) {
       })
     );
     out.push(...(page.ContactFlowSummaryList || []));
+    nextToken = page.NextToken;
+  } while (nextToken);
+  return out;
+}
+
+async function listAllHoursOfOperations(region: string, instanceId: string) {
+  const c = clientFor(region);
+  const out: Array<{ Id?: string; Arn?: string; Name?: string }> = [];
+  let nextToken: string | undefined = undefined;
+  do {
+    const page: ListHoursOfOperationsCommandOutput = await c.send(
+      new ListHoursOfOperationsCommand({
+        InstanceId: instanceId,
+        MaxResults: 100,
+        NextToken: nextToken
+      })
+    );
+    out.push(...(page.HoursOfOperationSummaryList || []));
+    nextToken = page.NextToken;
+  } while (nextToken);
+  return out;
+}
+
+async function listAllQueues(region: string, instanceId: string) {
+  const c = clientFor(region);
+  const out: Array<{ Id?: string; Arn?: string; Name?: string; QueueType?: string }> = [];
+  let nextToken: string | undefined = undefined;
+  do {
+    const page: ListQueuesCommandOutput = await c.send(
+      new ListQueuesCommand({
+        InstanceId: instanceId,
+        MaxResults: 100,
+        NextToken: nextToken
+      })
+    );
+    out.push(...(page.QueueSummaryList || []));
     nextToken = page.NextToken;
   } while (nextToken);
   return out;
@@ -172,8 +248,53 @@ connectRouter.post("/export", async (req, res) => {
   try {
     const c = clientFor(region);
 
+    const hours = await listAllHoursOfOperations(region, instanceId);
+    const queues = await listAllQueues(region, instanceId);
     const modules = await listAllContactFlowModules(region, instanceId);
     const flows = await listAllContactFlows(region, instanceId);
+
+    const hoursOfOperations: ExportedHoursOfOperation[] = [];
+    for (const h of hours) {
+      if (!h.Id || !h.Name) continue;
+      const d = await c.send(new DescribeHoursOfOperationCommand({ InstanceId: instanceId, HoursOfOperationId: h.Id }));
+      const ho = d.HoursOfOperation;
+      if (!ho?.Name) continue;
+      hoursOfOperations.push({
+        id: (ho as any).HoursOfOperationId,
+        arn: (ho as any).HoursOfOperationArn,
+        name: ho.Name,
+        description: ho.Description,
+        timeZone: (ho as any).TimeZone,
+        config: (ho as any).Config,
+        tags: (ho as any).Tags
+      });
+    }
+
+    const hoursById = new Map<string, string>();
+    for (const h of hoursOfOperations) {
+      if (h.id && h.name) hoursById.set(h.id, h.name);
+    }
+
+    const exportedQueues: ExportedQueue[] = [];
+    for (const q of queues) {
+      if (!q.Id || !q.Name) continue;
+      const d = await c.send(new DescribeQueueCommand({ InstanceId: instanceId, QueueId: q.Id }));
+      const qq = d.Queue as any;
+      if (!qq?.Name) continue;
+      const hoursName = qq.HoursOfOperationId ? hoursById.get(qq.HoursOfOperationId) : undefined;
+      exportedQueues.push({
+        id: qq.QueueId,
+        arn: qq.QueueArn,
+        name: qq.Name,
+        description: qq.Description,
+        status: qq.Status,
+        maxContacts: qq.MaxContacts,
+        hoursOfOperationId: qq.HoursOfOperationId,
+        hoursOfOperationName: hoursName,
+        outboundCallerConfig: qq.OutboundCallerConfig,
+        tags: qq.Tags
+      });
+    }
 
     const flowModules: ExportedFlowModule[] = [];
     for (const m of modules) {
@@ -221,6 +342,8 @@ connectRouter.post("/export", async (req, res) => {
       version: 1,
       exportedAt: new Date().toISOString(),
       source: { region, instanceId },
+      hoursOfOperations,
+      queues: exportedQueues,
       flowModules,
       contactFlows
     };
@@ -237,13 +360,14 @@ connectRouter.post("/import", async (req, res) => {
       region: z.string().min(1),
       instanceId: z.string().min(1),
       overwrite: z.boolean().optional().default(false),
+      dryRun: z.boolean().optional().default(false),
       bundle: z.any()
     })
     .safeParse(req.body);
 
   if (!body.success) return res.status(400).json({ error: "Missing required fields" });
 
-  const { region, instanceId, overwrite } = body.data;
+  const { region, instanceId, overwrite, dryRun } = body.data;
 
   const bundle = body.data.bundle as ExportBundleV1;
   if (bundle?.version !== 1 || !Array.isArray(bundle.contactFlows) || !Array.isArray(bundle.flowModules)) {
@@ -253,7 +377,182 @@ connectRouter.post("/import", async (req, res) => {
   try {
     const c = clientFor(region);
 
-    // Build target lookup tables
+    const hoursByName = new Map<string, { Id?: string; Arn?: string; Name?: string }>();
+    const queueByName = new Map<string, { Id?: string; Arn?: string; Name?: string }>();
+
+    // Build target lookup tables (hours + queues)
+    const existingHours = await listAllHoursOfOperations(region, instanceId);
+    for (const h of existingHours) {
+      if (h.Name) hoursByName.set(h.Name, h);
+    }
+
+    const existingQueues = await listAllQueues(region, instanceId);
+    for (const q of existingQueues) {
+      if (q.Name) queueByName.set(q.Name, q);
+    }
+
+    const hoursReplacements: Array<[string, string]> = [];
+    const queueReplacements: Array<[string, string]> = [];
+
+    let createdHours = 0;
+    let updatedHours = 0;
+    let skippedHours = 0;
+
+    let createdQueues = 0;
+    let updatedQueues = 0;
+    let skippedQueues = 0;
+
+    // 0) Upsert hours of operation
+    for (const h of bundle.hoursOfOperations || []) {
+      if (!h?.name) continue;
+      const existing = hoursByName.get(h.name);
+
+      if (existing?.Id) {
+        if (!overwrite) {
+          skippedHours++;
+        } else {
+          if (!dryRun) {
+            await c.send(
+              new UpdateHoursOfOperationCommand({
+                InstanceId: instanceId,
+                HoursOfOperationId: existing.Id,
+                Name: h.name,
+                Description: h.description,
+                TimeZone: h.timeZone,
+                Config: h.config
+              } as any)
+            );
+          }
+          updatedHours++;
+        }
+        if (h.id && existing.Id) hoursReplacements.push([h.id, existing.Id]);
+        if (h.arn && existing.Arn) hoursReplacements.push([h.arn, existing.Arn]);
+        continue;
+      }
+
+      if (dryRun) {
+        createdHours++;
+        continue;
+      }
+
+      const created = await c.send(
+        new CreateHoursOfOperationCommand({
+          InstanceId: instanceId,
+          Name: h.name,
+          Description: h.description,
+          TimeZone: h.timeZone,
+          Config: h.config,
+          Tags: h.tags
+        } as any)
+      );
+      createdHours++;
+
+      const createdId = (created as any).HoursOfOperationId;
+      const createdArn = (created as any).HoursOfOperationArn;
+
+      if (h.id && createdId) hoursReplacements.push([h.id, createdId]);
+      if (h.arn && createdArn) hoursReplacements.push([h.arn, createdArn]);
+
+      hoursByName.set(h.name, { Id: createdId, Arn: createdArn, Name: h.name });
+    }
+
+    // 0b) Upsert queues
+    for (const q of bundle.queues || []) {
+      if (!q?.name) continue;
+      const existing = queueByName.get(q.name);
+
+      // Resolve hours-of-operation in the target (by name preferred)
+      let targetHoursId: string | undefined = undefined;
+      if (q.hoursOfOperationName) {
+        targetHoursId = hoursByName.get(q.hoursOfOperationName)?.Id;
+      }
+      if (!targetHoursId && q.hoursOfOperationId) {
+        // fallback: if the bundle hours were imported, replacements may already contain the mapping
+        const repl = hoursReplacements.find(([from]) => from === q.hoursOfOperationId);
+        targetHoursId = repl?.[1];
+      }
+
+      if (existing?.Id) {
+        if (!overwrite) {
+          skippedQueues++;
+        } else {
+          if (!dryRun) {
+            if (typeof q.maxContacts === "number") {
+              await c.send(
+                new UpdateQueueMaxContactsCommand({
+                  InstanceId: instanceId,
+                  QueueId: existing.Id,
+                  MaxContacts: q.maxContacts
+                } as any)
+              );
+            }
+            if (targetHoursId) {
+              await c.send(
+                new UpdateQueueHoursOfOperationCommand({
+                  InstanceId: instanceId,
+                  QueueId: existing.Id,
+                  HoursOfOperationId: targetHoursId
+                } as any)
+              );
+            }
+            if (q.outboundCallerConfig) {
+              await c.send(
+                new UpdateQueueOutboundCallerConfigCommand({
+                  InstanceId: instanceId,
+                  QueueId: existing.Id,
+                  OutboundCallerConfig: q.outboundCallerConfig
+                } as any)
+              );
+            }
+            if (q.status) {
+              await c.send(
+                new UpdateQueueStatusCommand({
+                  InstanceId: instanceId,
+                  QueueId: existing.Id,
+                  Status: q.status
+                } as any)
+              );
+            }
+          }
+          updatedQueues++;
+        }
+        if (q.id && existing.Id) queueReplacements.push([q.id, existing.Id]);
+        if (q.arn && existing.Arn) queueReplacements.push([q.arn, existing.Arn]);
+        continue;
+      }
+
+      if (dryRun) {
+        createdQueues++;
+        continue;
+      }
+
+      if (!targetHoursId) {
+        throw new Error(`Queue '${q.name}' is missing a resolvable hoursOfOperationId/name`);
+      }
+
+      const created = await c.send(
+        new CreateQueueCommand({
+          InstanceId: instanceId,
+          Name: q.name,
+          Description: q.description,
+          HoursOfOperationId: targetHoursId,
+          MaxContacts: q.maxContacts,
+          OutboundCallerConfig: q.outboundCallerConfig,
+          Tags: q.tags
+        } as any)
+      );
+      createdQueues++;
+
+      const createdId = (created as any).QueueId;
+      const createdArn = (created as any).QueueArn;
+
+      if (q.id && createdId) queueReplacements.push([q.id, createdId]);
+      if (q.arn && createdArn) queueReplacements.push([q.arn, createdArn]);
+
+      queueByName.set(q.name, { Id: createdId, Arn: createdArn, Name: q.name });
+    }
+
+    // Build target lookup tables (modules)
     const existingModules = await listAllContactFlowModules(region, instanceId);
     const moduleByName = new Map<string, { Id?: string; Arn?: string; Name?: string }>();
     for (const m of existingModules) {
@@ -270,17 +569,20 @@ connectRouter.post("/import", async (req, res) => {
     for (const m of bundle.flowModules) {
       if (!m.name) continue;
       const existing = moduleByName.get(m.name);
+      const baseContent =
+        typeof m.content === "string" ? applyReplacements(m.content, [...hoursReplacements, ...queueReplacements]) : "{}";
+
       if (existing?.Id) {
         if (!overwrite) {
           skippedModules++;
           continue;
         }
-        if (typeof m.content === "string") {
+        if (!dryRun && typeof baseContent === "string") {
           await c.send(
             new UpdateContactFlowModuleContentCommand({
               InstanceId: instanceId,
               ContactFlowModuleId: existing.Id,
-              Content: m.content,
+              Content: baseContent,
               Settings: m.settings
             })
           );
@@ -291,12 +593,17 @@ connectRouter.post("/import", async (req, res) => {
         continue;
       }
 
+      if (dryRun) {
+        createdModules++;
+        continue;
+      }
+
       const created = await c.send(
         new CreateContactFlowModuleCommand({
           InstanceId: instanceId,
           Name: m.name,
           Description: m.description,
-          Content: m.content || "{}",
+          Content: baseContent || "{}",
           Tags: m.tags,
           Settings: m.settings
         })
@@ -331,26 +638,39 @@ connectRouter.post("/import", async (req, res) => {
 
       const key = `${f.type}|${f.name}`;
       const existing = flowByNameType.get(key);
-      const content1 = typeof f.content === "string" ? applyReplacements(f.content, moduleReplacements) : "{}";
+      const content1 =
+        typeof f.content === "string"
+          ? applyReplacements(
+              applyReplacements(f.content, [...hoursReplacements, ...queueReplacements]),
+              moduleReplacements
+            )
+          : "{}";
 
       if (existing?.Id) {
         if (!overwrite) {
           skippedFlows++;
           continue;
         }
-        await c.send(
-          new UpdateContactFlowContentCommand({
-            InstanceId: instanceId,
-            ContactFlowId: existing.Id,
-            Content: content1
-          })
-        );
+        if (!dryRun) {
+          await c.send(
+            new UpdateContactFlowContentCommand({
+              InstanceId: instanceId,
+              ContactFlowId: existing.Id,
+              Content: content1
+            })
+          );
+        }
         updatedFlows++;
 
         if (f.id) flowReplacements.push([f.id, existing.Id]);
         if (f.arn && existing.Arn) flowReplacements.push([f.arn, existing.Arn]);
 
         importedFlowTargets.push({ source: f, targetId: existing.Id });
+        continue;
+      }
+
+      if (dryRun) {
+        createdFlows++;
         continue;
       }
 
@@ -382,31 +702,44 @@ connectRouter.post("/import", async (req, res) => {
     }
 
     // 3) Second pass: update imported flows to replace flow-to-flow references too
-    for (const { source, targetId } of importedFlowTargets) {
-      if (!overwrite && createdFlows === 0 && updatedFlows === 0) break;
-      if (typeof source.content !== "string") continue;
+    if (!dryRun && overwrite) {
+      for (const { source, targetId } of importedFlowTargets) {
+        if (!overwrite && createdFlows === 0 && updatedFlows === 0) break;
+        if (typeof source.content !== "string") continue;
 
-      const content2 = applyReplacements(
-        applyReplacements(source.content, moduleReplacements),
-        flowReplacements
-      );
+        const content2 = applyReplacements(
+          applyReplacements(
+            applyReplacements(source.content, [...hoursReplacements, ...queueReplacements]),
+            moduleReplacements
+          ),
+          flowReplacements
+        );
 
-      await c.send(
-        new UpdateContactFlowContentCommand({
-          InstanceId: instanceId,
-          ContactFlowId: targetId,
-          Content: content2
-        })
-      );
+        await c.send(
+          new UpdateContactFlowContentCommand({
+            InstanceId: instanceId,
+            ContactFlowId: targetId,
+            Content: content2
+          })
+        );
+      }
     }
 
     return res.status(200).json({
+      createdHours,
+      updatedHours,
+      skippedHours,
+      createdQueues,
+      updatedQueues,
+      skippedQueues,
       createdModules,
       updatedModules,
       skippedModules,
       createdFlows,
       updatedFlows,
-      skippedFlows
+      skippedFlows,
+      dryRun,
+      overwrite
     });
   } catch (e: any) {
     return res.status(500).json({ error: e?.message || String(e) });

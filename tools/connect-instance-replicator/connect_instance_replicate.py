@@ -58,6 +58,79 @@ def _apply_replacements(content: str, replacements: List[Tuple[str, str]]) -> st
 def export_bundle(*, profile: Optional[str], region: str, instance_id: str) -> Dict[str, Any]:
     client = _connect_client(profile, region)
 
+    # Hours of operation
+    hours_summaries: List[Dict[str, Any]] = []
+    for page in _paginate(client.list_hours_of_operations, InstanceId=instance_id, MaxResults=100):
+        hours_summaries.extend(page.get("HoursOfOperationSummaryList") or [])
+
+    hours_of_operations: List[Dict[str, Any]] = []
+    for h in hours_summaries:
+        hid = h.get("Id")
+        if not hid:
+            continue
+        d = client.describe_hours_of_operation(InstanceId=instance_id, HoursOfOperationId=hid)
+        ho = d.get("HoursOfOperation") or {}
+        if ho.get("Name"):
+            hours_of_operations.append(
+                {
+                    "id": ho.get("HoursOfOperationId"),
+                    "arn": ho.get("HoursOfOperationArn"),
+                    "name": ho.get("Name"),
+                    "description": ho.get("Description"),
+                    "timeZone": ho.get("TimeZone"),
+                    "config": ho.get("Config"),
+                    "tags": ho.get("Tags"),
+                }
+            )
+
+    hours_name_by_id: Dict[str, str] = {}
+    for ho in hours_of_operations:
+        if ho.get("id") and ho.get("name"):
+            hours_name_by_id[str(ho["id"])]=str(ho["name"])
+
+    # Queues
+    # Best-effort: some accounts/instances can return queue IDs that fail DescribeQueue (eventual consistency
+    # or deleted resources). We skip those rather than failing the entire export.
+    queue_summaries: List[Dict[str, Any]] = []
+    for page in _paginate(
+        client.list_queues,
+        InstanceId=instance_id,
+        MaxResults=100,
+        QueueTypes=["STANDARD"],
+    ):
+        queue_summaries.extend(page.get("QueueSummaryList") or [])
+
+    queues: List[Dict[str, Any]] = []
+    for q in queue_summaries:
+        qid = q.get("Id")
+        if not qid:
+            continue
+        try:
+            d = client.describe_queue(InstanceId=instance_id, QueueId=qid)
+        except ClientError as e:
+            code = (e.response or {}).get("Error", {}).get("Code")
+            if code == "ResourceNotFoundException":
+                print(f"WARN: skipping queue id {qid}: {code}", file=sys.stderr)
+                continue
+            raise
+        qq = d.get("Queue") or {}
+        if qq.get("Name"):
+            hours_id = qq.get("HoursOfOperationId")
+            queues.append(
+                {
+                    "id": qq.get("QueueId"),
+                    "arn": qq.get("QueueArn"),
+                    "name": qq.get("Name"),
+                    "description": qq.get("Description"),
+                    "status": qq.get("Status"),
+                    "maxContacts": qq.get("MaxContacts"),
+                    "hoursOfOperationId": hours_id,
+                    "hoursOfOperationName": hours_name_by_id.get(str(hours_id)) if hours_id else None,
+                    "outboundCallerConfig": qq.get("OutboundCallerConfig"),
+                    "tags": qq.get("Tags"),
+                }
+            )
+
     # Modules
     modules: List[Dict[str, Any]] = []
     for page in _paginate(client.list_contact_flow_modules, InstanceId=instance_id, MaxResults=100):
@@ -121,6 +194,8 @@ def export_bundle(*, profile: Optional[str], region: str, instance_id: str) -> D
         "version": 1,
         "exportedAt": __import__("datetime").datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
         "source": {"region": region, "instanceId": instance_id},
+        "hoursOfOperations": hours_of_operations,
+        "queues": queues,
         "flowModules": flow_modules,
         "contactFlows": contact_flows,
     }
@@ -140,6 +215,156 @@ def import_bundle(
 
     client = _connect_client(profile, region)
 
+    # Existing hours of operation
+    existing_hours: Dict[str, Dict[str, Any]] = {}
+    for page in _paginate(client.list_hours_of_operations, InstanceId=instance_id, MaxResults=100):
+        for h in page.get("HoursOfOperationSummaryList") or []:
+            if h.get("Name"):
+                existing_hours[h["Name"]] = h
+
+    hours_repl: List[Tuple[str, str]] = []
+    created_hours = updated_hours = skipped_hours = 0
+
+    for h in bundle.get("hoursOfOperations") or []:
+        name = h.get("name")
+        if not name:
+            continue
+        existing = existing_hours.get(name)
+
+        if existing and existing.get("Id"):
+            if not overwrite:
+                skipped_hours += 1
+            else:
+                if not dry_run:
+                    client.update_hours_of_operation(
+                        InstanceId=instance_id,
+                        HoursOfOperationId=existing["Id"],
+                        Name=name,
+                        Description=h.get("description"),
+                        TimeZone=h.get("timeZone"),
+                        Config=h.get("config"),
+                    )
+                updated_hours += 1
+
+            if h.get("id"):
+                hours_repl.append((h["id"], existing["Id"]))
+            if h.get("arn") and existing.get("Arn"):
+                hours_repl.append((h["arn"], existing["Arn"]))
+            continue
+
+        if dry_run:
+            created_hours += 1
+            continue
+
+        resp = client.create_hours_of_operation(
+            InstanceId=instance_id,
+            Name=name,
+            Description=h.get("description"),
+            TimeZone=h.get("timeZone"),
+            Config=h.get("config"),
+            Tags=h.get("tags"),
+        )
+        created_hours += 1
+
+        existing_hours[name] = {
+            "Id": resp.get("HoursOfOperationId"),
+            "Arn": resp.get("HoursOfOperationArn"),
+            "Name": name,
+        }
+        if h.get("id") and resp.get("HoursOfOperationId"):
+            hours_repl.append((h["id"], resp["HoursOfOperationId"]))
+        if h.get("arn") and resp.get("HoursOfOperationArn"):
+            hours_repl.append((h["arn"], resp["HoursOfOperationArn"]))
+
+    def _resolve_hours_id(q: Dict[str, Any]) -> Optional[str]:
+        if q.get("hoursOfOperationName"):
+            eh = existing_hours.get(str(q["hoursOfOperationName"]))
+            if eh and eh.get("Id"):
+                return str(eh["Id"])
+        if q.get("hoursOfOperationId"):
+            for src, dst in hours_repl:
+                if src == q["hoursOfOperationId"]:
+                    return dst
+        return None
+
+    # Existing queues
+    existing_queues: Dict[str, Dict[str, Any]] = {}
+    for page in _paginate(client.list_queues, InstanceId=instance_id, MaxResults=100):
+        for q in page.get("QueueSummaryList") or []:
+            if q.get("Name"):
+                existing_queues[q["Name"]] = q
+
+    queue_repl: List[Tuple[str, str]] = []
+    created_queues = updated_queues = skipped_queues = 0
+
+    for q in bundle.get("queues") or []:
+        name = q.get("name")
+        if not name:
+            continue
+        existing = existing_queues.get(name)
+        target_hours_id = _resolve_hours_id(q)
+
+        if existing and existing.get("Id"):
+            if not overwrite:
+                skipped_queues += 1
+            else:
+                if not dry_run:
+                    if isinstance(q.get("maxContacts"), int):
+                        client.update_queue_max_contacts(
+                            InstanceId=instance_id,
+                            QueueId=existing["Id"],
+                            MaxContacts=q.get("maxContacts"),
+                        )
+                    if target_hours_id:
+                        client.update_queue_hours_of_operation(
+                            InstanceId=instance_id,
+                            QueueId=existing["Id"],
+                            HoursOfOperationId=target_hours_id,
+                        )
+                    if q.get("outboundCallerConfig"):
+                        client.update_queue_outbound_caller_config(
+                            InstanceId=instance_id,
+                            QueueId=existing["Id"],
+                            OutboundCallerConfig=q.get("outboundCallerConfig"),
+                        )
+                    if q.get("status"):
+                        client.update_queue_status(
+                            InstanceId=instance_id,
+                            QueueId=existing["Id"],
+                            Status=q.get("status"),
+                        )
+                updated_queues += 1
+
+            if q.get("id"):
+                queue_repl.append((q["id"], existing["Id"]))
+            if q.get("arn") and existing.get("Arn"):
+                queue_repl.append((q["arn"], existing["Arn"]))
+            continue
+
+        if dry_run:
+            created_queues += 1
+            continue
+
+        if not target_hours_id:
+            raise RuntimeError(f"Queue '{name}' is missing a resolvable hoursOfOperationId/name")
+
+        resp = client.create_queue(
+            InstanceId=instance_id,
+            Name=name,
+            Description=q.get("description"),
+            HoursOfOperationId=target_hours_id,
+            MaxContacts=q.get("maxContacts"),
+            OutboundCallerConfig=q.get("outboundCallerConfig"),
+            Tags=q.get("tags"),
+        )
+        created_queues += 1
+
+        existing_queues[name] = {"Id": resp.get("QueueId"), "Arn": resp.get("QueueArn"), "Name": name}
+        if q.get("id") and resp.get("QueueId"):
+            queue_repl.append((q["id"], resp["QueueId"]))
+        if q.get("arn") and resp.get("QueueArn"):
+            queue_repl.append((q["arn"], resp["QueueArn"]))
+
     # Existing modules
     existing_modules: Dict[str, Dict[str, Any]] = {}
     for page in _paginate(client.list_contact_flow_modules, InstanceId=instance_id, MaxResults=100):
@@ -157,6 +382,8 @@ def import_bundle(
             continue
         existing = existing_modules.get(name)
 
+        content0 = _apply_replacements(_apply_replacements(str(m.get("content") or "{}"), hours_repl), queue_repl)
+
         if existing and existing.get("Id"):
             if not overwrite:
                 skipped_modules += 1
@@ -165,7 +392,7 @@ def import_bundle(
                     client.update_contact_flow_module_content(
                         InstanceId=instance_id,
                         ContactFlowModuleId=existing["Id"],
-                        Content=m.get("content") or "{}",
+                        Content=content0,
                         Settings=m.get("settings"),
                     )
                 updated_modules += 1
@@ -184,7 +411,7 @@ def import_bundle(
             InstanceId=instance_id,
             Name=name,
             Description=m.get("description"),
-            Content=m.get("content") or "{}",
+            Content=content0,
             Tags=m.get("tags"),
             Settings=m.get("settings"),
         )
@@ -223,7 +450,10 @@ def import_bundle(
         existing = existing_flows.get(key)
 
         raw_content = f.get("content") or "{}"
-        content1 = _apply_replacements(str(raw_content), module_repl)
+        content1 = _apply_replacements(
+            _apply_replacements(_apply_replacements(str(raw_content), hours_repl), queue_repl),
+            module_repl,
+        )
 
         if existing and existing.get("Id"):
             if not overwrite:
@@ -284,7 +514,13 @@ def import_bundle(
             raw_content = src_flow.get("content")
             if not isinstance(raw_content, str):
                 continue
-            content2 = _apply_replacements(_apply_replacements(raw_content, module_repl), flow_repl)
+            content2 = _apply_replacements(
+                _apply_replacements(
+                    _apply_replacements(_apply_replacements(raw_content, hours_repl), queue_repl),
+                    module_repl,
+                ),
+                flow_repl,
+            )
             client.update_contact_flow_content(
                 InstanceId=instance_id,
                 ContactFlowId=target_id,
@@ -292,6 +528,12 @@ def import_bundle(
             )
 
     return {
+        "createdHours": created_hours,
+        "updatedHours": updated_hours,
+        "skippedHours": skipped_hours,
+        "createdQueues": created_queues,
+        "updatedQueues": updated_queues,
+        "skippedQueues": skipped_queues,
         "createdModules": created_modules,
         "updatedModules": updated_modules,
         "skippedModules": skipped_modules,
@@ -305,18 +547,18 @@ def import_bundle(
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Best-effort Amazon Connect exporter/importer using primitive Connect APIs (flows + modules)."
+        description="Best-effort Amazon Connect exporter/importer using primitive Connect APIs (hours, queues, flows + modules)."
     )
     p.add_argument("--profile", default=None, help="AWS credential profile name (optional)")
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    exp = sub.add_parser("export", help="Export a bundle (flows + flow modules)")
+    exp = sub.add_parser("export", help="Export a bundle (hours, queues, flows + flow modules)")
     exp.add_argument("--region", required=True)
     exp.add_argument("--instance-id", required=True)
     exp.add_argument("--out", required=False, default="-", help="Output file path, or '-' for stdout")
 
-    imp = sub.add_parser("import", help="Import a bundle into an existing instance")
+    imp = sub.add_parser("import", help="Import a bundle into an existing instance (hours, queues, flows + modules)")
     imp.add_argument("--region", required=True)
     imp.add_argument("--instance-id", required=True)
     imp.add_argument("--in", dest="in_path", required=True, help="Input bundle JSON path")
