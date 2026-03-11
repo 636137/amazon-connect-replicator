@@ -4,27 +4,53 @@ A **best-effort** exporter/importer to replicate Amazon Connect configuration fr
 
 This repo is intentionally scoped to what Connect exposes as CRUD-style APIs; it is **not** Amazon Connect Global Resiliency.
 
-## 🤖 NEW: Interactive AI Agent
+---
 
-Use the **GitHub Copilot AI Agent** for guided, interactive replication:
+## 🤖 Interactive AI Agent (Instance Manager)
 
-```bash
-# Install the agent skill
-cp -r copilot-skills/connect-replication-agent ~/.copilot/skills/
+The **Amazon Connect Instance Manager Agent** provides a conversational interface for complete instance management:
 
-# Then in Copilot CLI:
-Use the connect-replication-agent skill to replicate my Connect instance
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                   AGENT CAPABILITIES                                 │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐             │
+│  │   CREATE    │    │  REPLICATE  │    │  DESCRIBE   │             │
+│  │             │    │             │    │             │             │
+│  │ New Connect │    │ Copy config │    │ Full audit  │             │
+│  │  instance   │    │ src → tgt   │    │ of instance │             │
+│  │             │    │             │    │             │             │
+│  └─────────────┘    └─────────────┘    └─────────────┘             │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-The agent will:
-- 🔍 Discover instances in your regions
-- ❓ Ask clarifying questions (source, target, options)
-- 🚀 Execute replication with your choices
-- 🔧 Troubleshoot any issues
-- 📊 Provide detailed summaries
-- 💬 Support follow-up commands
+### Quick Start
 
-See: [Copilot AI Agent](#copilot-ai-agent-interactive-replication)
+```bash
+# Install the agent and supporting skills
+cp -r copilot-skills/connect-replication-agent ~/.copilot/skills/
+cp -r copilot-skills/connect-instance-replication ~/.copilot/skills/
+
+# Invoke in Copilot CLI
+Use the connect-replication-agent skill to manage my Connect instances
+```
+
+### Agent Commands
+
+| Action | Example Command |
+|--------|-----------------|
+| **Create** | `Create a new Connect instance in us-west-2` |
+| **Create (named)** | `Create Connect instance my-dr-connect in us-east-1` |
+| **Replicate** | `Replicate from my-prod to my-dr in us-west-2` |
+| **Replicate (dry run)** | `Do a dry run replication from source to target` |
+| **Describe** | `Describe my-prod-connect instance in us-east-1` |
+| **Describe (audit)** | `Audit all resources in Connect instance abc-123` |
+| **Discovery** | `List all Connect instances in us-east-1` |
+| **Verify** | `Verify resource counts in my-dr-connect` |
+
+See: [Full AI Agent Documentation](#copilot-ai-agent-instance-manager)
 
 ---
 
@@ -156,25 +182,204 @@ See: [`copilot-skills/connect-instance-replication/SKILL.md`](copilot-skills/con
 
 ---
 
-## Copilot AI Agent (Interactive Replication)
+## Copilot AI Agent (Instance Manager)
 
-The **connect-replication-agent** provides an interactive, conversational interface for Connect instance replication.
+The **connect-replication-agent** is a comprehensive Amazon Connect Instance Manager with three core capabilities.
 
 ### Installation
 
 ```bash
-# Copy the agent skill to your Copilot skills directory
+# Copy both skills to your Copilot skills directory
 cp -r copilot-skills/connect-replication-agent ~/.copilot/skills/
-
-# Also install the underlying replication skill (if not already installed)
 cp -r copilot-skills/connect-instance-replication ~/.copilot/skills/
+
+# Verify installation
+ls ~/.copilot/skills/
+# Should show: connect-replication-agent, connect-instance-replication
 ```
 
-### Usage Examples
+### Prerequisites
 
-#### Basic Replication (Guided)
+- AWS credentials configured (env vars, `~/.aws/credentials`, or IAM role)
+- Python 3.9+ with boto3 installed
+- This repo cloned to `~/amazon-connect-replicator`
+- IAM permissions for Connect APIs (see [IAM Permissions](#iam-permissions))
+
+---
+
+## 1. CREATE - New Instance Creation
+
+Create new Amazon Connect instances with guided configuration.
+
+### CREATE Usage Examples
+
 ```
-User: Use the connect-replication-agent skill to replicate my Connect instance
+Create a new Connect instance in us-west-2
+```
+
+```
+Create a Connect instance called my-dr-connect in us-east-1
+```
+
+```
+Create a DR instance for my production contact center
+```
+
+### CREATE Workflow
+
+The agent will:
+
+1. **Ask clarifying questions:**
+   - Which AWS region?
+   - Instance alias (name)?
+   - Identity management type? (CONNECT_MANAGED, SAML, EXISTING_DIRECTORY)
+   - Enable inbound calls?
+   - Enable outbound calls?
+   - Enable Contact Lens?
+   - Enable contact flow logs?
+
+2. **Generate and deploy** via AWS CLI:
+   ```bash
+   aws connect create-instance \
+     --identity-management-type CONNECT_MANAGED \
+     --instance-alias my-new-instance \
+     --inbound-calls-enabled \
+     --outbound-calls-enabled
+   ```
+
+3. **Wait for ACTIVE status** and provide summary
+
+### CREATE Example Session
+
+```
+User: Create a new Connect instance in us-west-2
+
+Agent: I'll help you create a new Amazon Connect instance. Let me ask a few questions:
+
+What should the instance alias (name) be?
+> my-dr-connect
+
+What identity management type?
+  1. CONNECT_MANAGED (recommended for quick setup)
+  2. SAML (for SSO integration)
+  3. EXISTING_DIRECTORY (for Active Directory)
+> 1
+
+Enable inbound calls? (Yes/No)
+> Yes
+
+Enable outbound calls? (Yes/No)
+> Yes
+
+Enable Contact Lens for analytics? (Yes/No)
+> Yes
+
+Creating instance with these settings:
+  - Region: us-west-2
+  - Alias: my-dr-connect
+  - Identity: CONNECT_MANAGED
+  - Inbound: Yes
+  - Outbound: Yes
+  - Contact Lens: Yes
+
+Proceed? (Yes/No)
+> Yes
+
+Creating instance... ⏳
+
+✅ Instance Created Successfully!
+
+Instance Details:
+  - ID: 07eadde0-065b-4a96-ab60-d5a18aaa5a72
+  - ARN: arn:aws:connect:us-west-2:123456789012:instance/07eadde0-...
+  - Alias: my-dr-connect
+  - Status: ACTIVE
+  - Access URL: https://my-dr-connect.my.connect.aws
+
+Next Steps:
+1. Claim phone numbers
+2. Create users and security profiles
+3. Build contact flows
+4. Or replicate configuration from an existing instance
+
+What would you like to do next?
+```
+
+### CREATE CloudFormation Template
+
+The agent can also generate CloudFormation:
+
+```yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Amazon Connect Instance
+
+Parameters:
+  InstanceAlias:
+    Type: String
+    Description: Unique alias for the Connect instance
+
+Resources:
+  ConnectInstance:
+    Type: AWS::Connect::Instance
+    Properties:
+      IdentityManagementType: CONNECT_MANAGED
+      InstanceAlias: !Ref InstanceAlias
+      Attributes:
+        InboundCalls: true
+        OutboundCalls: true
+        ContactflowLogs: true
+        ContactLens: true
+        AutoResolveBestVoices: true
+        UseCustomTTSVoices: false
+        EarlyMedia: true
+
+Outputs:
+  InstanceId:
+    Value: !Ref ConnectInstance
+  InstanceArn:
+    Value: !GetAtt ConnectInstance.Arn
+```
+
+---
+
+## 2. REPLICATE - Cross-Region Configuration Sync
+
+Replicate all 19 resource types from a source instance to a target instance.
+
+### REPLICATE Usage Examples
+
+```
+Replicate Connect instance from us-east-1 to us-west-2
+```
+
+```
+Replicate from my-prod-connect to my-dr-connect
+```
+
+```
+Sync configuration from source to target instance
+```
+
+```
+Do a dry run replication to preview changes
+```
+
+### REPLICATE Workflow
+
+1. **Discover instances** in source and target regions
+2. **Ask clarifying questions:**
+   - Confirm source instance
+   - Confirm target instance
+   - Overwrite existing resources?
+   - Skip unsupported flows (Lambda/Lex dependencies)?
+   - Continue on individual errors?
+3. **Execute replication** with progress updates
+4. **Provide detailed summary** with source vs target comparison
+
+### REPLICATE Example Session
+
+```
+User: Replicate my Connect instance from us-east-1 to us-west-2
 
 Agent: Let me discover the available Connect instances...
 
@@ -182,151 +387,208 @@ Found in us-east-1:
   1. my-prod-connect (ACTIVE)
   2. my-test-connect (ACTIVE)
 
-Which region contains your SOURCE instance?
-> us-east-1
+Found in us-west-2:
+  1. my-dr-connect (ACTIVE)
 
 Which instance should be the SOURCE?
 > my-prod-connect
 
-Which region contains your TARGET instance?
-> us-west-2
+Which instance should be the TARGET?
+> my-dr-connect
 
-[Agent discovers instances in us-west-2...]
-```
-
-#### Direct Replication
-```
-User: Replicate Connect from my-prod-connect in us-east-1 to my-dr-connect in us-west-2
-
-Agent: I'll replicate from my-prod-connect (us-east-1) to my-dr-connect (us-west-2).
-
-Should I overwrite existing resources in the target? (Yes/No)
+Should I overwrite existing resources? (Yes/No)
 > Yes
 
-Should I skip flows with unsupported dependencies (Lambda/Lex/prompts not in target)? (Yes/No)
+Should I skip flows with unsupported dependencies? (Yes/No)
 > Yes
 
 Proceeding with replication...
-```
 
-#### Dry Run Preview
-```
-User: Do a dry run replication from us-east-1 to us-west-2
-
-Agent: Running in dry-run mode (no changes will be made)...
-[Shows what would be created/updated without making changes]
-```
-
-#### Discovery Only
-```
-User: List all Connect instances in us-east-1 and us-west-2
-
-Agent: 
-us-east-1:
-  - my-prod-connect (ACTIVE) - abc-123-def
-  - my-test-connect (ACTIVE) - xyz-789-uvw
-
-us-west-2:
-  - my-dr-connect (ACTIVE) - 111-222-333
-```
-
-#### Verification
-```
-User: Verify resource counts in my-dr-connect
-
-Agent: Resource counts for my-dr-connect (us-west-2):
-
-| Resource Type         | Count |
-|-----------------------|-------|
-| Hours of Operation    | 3     |
-| Agent Statuses        | 2     |
-| Security Profiles     | 4     |
-| Queues                | 9     |
-| Routing Profiles      | 4     |
-| Contact Flows         | 22    |
-| Prompts               | 7     |
-| Task Templates        | 1     |
-| Views                 | 5     |
-...
-```
-
-### Agent Workflow
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     INTERACTIVE WORKFLOW                             │
-├─────────────────────────────────────────────────────────────────────┤
-│  1. User invokes agent with replication request                      │
-│  2. Agent discovers instances in source/target regions               │
-│  3. Agent asks clarifying questions:                                 │
-│     • Confirm source and target instances                            │
-│     • Overwrite existing resources?                                  │
-│     • Skip unsupported flows?                                        │
-│     • Continue on errors?                                            │
-│  4. Agent executes replication with user's choices                   │
-│  5. Agent monitors progress and handles errors                       │
-│  6. Agent provides detailed summary of results                       │
-│  7. Agent offers follow-up options                                   │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### Example Replication Summary
-
-After replication, the agent provides a detailed summary:
-
-```
 ✅ Replication Complete!
 
-Source: my-prod-connect (us-east-1)
-Target: my-dr-connect (us-west-2)
-
-| Resource Type           | Source | Target | Status |
-|-------------------------|--------|--------|--------|
-| Hours of Operation      | 2      | 3      | ✅ +1 pre-existing |
-| Agent Statuses          | 2      | 2      | ✅ system statuses |
-| Security Profiles       | 4      | 4      | ✅     |
-| User Hierarchy Groups   | 0      | 0      | ✅     |
-| Queues                  | 4      | 9      | ✅ +5 pre-existing |
-| Routing Profiles        | 4      | 4      | ✅     |
-| Quick Connects          | 0      | 0      | ✅     |
-| Flow Modules            | 0      | 0      | ✅     |
-| Contact Flows           | 20     | 22     | ✅ +2 pre-existing |
-| Instance Attributes     | 10     | 10     | ✅     |
-| Predefined Attributes   | 14     | 14     | ✅ system attrs |
-| Prompts                 | 7      | 7      | ✅ mapped |
-| Task Templates          | 1      | 1      | ✅     |
-| Views                   | 5      | 5      | ✅     |
-| Rules                   | 0      | 0      | ✅     |
-| Evaluation Forms        | 0      | 0      | ✅     |
-| Vocabularies            | 0      | 0      | ✅     |
-| Lambda Functions        | 0      | 0      | ✅     |
-| Lex Bots                | 0      | 0      | ✅     |
-
-Skipped: 5 flows with unsupported dependencies
-Failures: 0
+| Resource Type         | Source | Target | Status |
+|-----------------------|--------|--------|--------|
+| Hours of Operation    | 2      | 2      | ✅     |
+| Agent Statuses        | 2      | 2      | ✅     |
+| Security Profiles     | 4      | 4      | ✅     |
+| Queues                | 6      | 6      | ✅     |
+| Routing Profiles      | 3      | 3      | ✅     |
+| Contact Flows         | 15     | 15     | ✅     |
+| Prompts               | 7      | 7      | ✅     |
+| ...                   | ...    | ...    | ...    |
 
 Artifacts saved to: ~/Downloads/acr-replication-runs/20260311T211921Z-abc123/
-  • bundle.json - exported configuration
-  • import-report.json - detailed results
-  • verify.json - post-import counts
 
 What would you like to do next?
-1. View detailed import report
-2. Replicate to another instance
-3. Ask a question about the results
 ```
 
-### Troubleshooting
+### REPLICATE CLI Flags
 
-The agent handles common issues:
+| Flag | Description |
+|------|-------------|
+| `--source-region` | AWS region of source instance |
+| `--source-alias` | Source instance alias (or use `--source-instance-id`) |
+| `--target-region` | AWS region of target instance |
+| `--target-alias` | Target instance alias (or use `--target-instance-id`) |
+| `--overwrite` | Update existing resources in target |
+| `--dry-run` | Preview without making changes |
+| `--skip-unsupported` | Skip flows with external dependencies |
+| `--continue-on-error` | Continue after individual resource errors |
+| `--yes` | Confirm live changes (required for non-dry-run) |
+| `--copy-lambda` | Copy Lambda functions to target region |
+| `--copy-lex` | Copy Lex V2 bots to target region |
+
+---
+
+## 3. DESCRIBE - Full Instance Audit
+
+Get complete details of all 19 resource types in a Connect instance.
+
+### DESCRIBE Usage Examples
+
+```
+Describe my-prod-connect instance
+```
+
+```
+Show all details of Connect instance in us-east-1
+```
+
+```
+Audit the Connect instance acr-repl-test-ozqb6i2i
+```
+
+```
+What resources are in my Connect instance?
+```
+
+### DESCRIBE Workflow
+
+1. **Identify the instance** (by alias or ID, in specified region)
+2. **Query all 19 resource types** via Connect APIs
+3. **Present comprehensive summary**
+
+### DESCRIBE Example Session
+
+```
+User: Describe my Connect instance my-prod-connect in us-east-1
+
+Agent: Let me gather complete details for my-prod-connect...
+
+═══════════════════════════════════════════════════════════════════
+                    CONNECT INSTANCE DETAILS
+═══════════════════════════════════════════════════════════════════
+
+INSTANCE METADATA
+─────────────────────────────────────────────────────────────────────
+  Alias:           my-prod-connect
+  ID:              be2975f8-7533-4c8c-b252-0f76ea9060da
+  ARN:             arn:aws:connect:us-east-1:123456789012:instance/be2975f8-...
+  Region:          us-east-1
+  Status:          ACTIVE
+  Created:         2026-02-15T10:30:00Z
+  Identity Type:   CONNECT_MANAGED
+
+INSTANCE ATTRIBUTES
+─────────────────────────────────────────────────────────────────────
+  Inbound Calls:              ✅ Enabled
+  Outbound Calls:             ✅ Enabled
+  Contact Flow Logs:          ✅ Enabled
+  Contact Lens:               ✅ Enabled
+  Auto Resolve Best Voices:   ✅ Enabled
+  Early Media:                ✅ Enabled
+  Multi-Party Conference:     ❌ Disabled
+  High Volume Outbound:       ❌ Disabled
+
+RESOURCE COUNTS (19 Types)
+─────────────────────────────────────────────────────────────────────
+  Hours of Operation:      2
+  Agent Statuses:          2 (Available, Offline - system defaults)
+  Security Profiles:       4 (Admin, Agent, CallCenterManager, QualityAnalyst)
+  User Hierarchy Groups:   0
+  Queues (STANDARD):       4 (BasicQueue, Sales, Support, Billing)
+  Routing Profiles:        4 (Basic, Sales, Support, Escalation)
+  Quick Connects:          0
+  Contact Flow Modules:    0
+  Contact Flows:           20
+  Predefined Attributes:   14 (system attributes)
+  Prompts:                 7
+  Task Templates:          1
+  Views:                   5
+  Rules:                   0
+  Evaluation Forms:        0
+  Vocabularies:            0
+  Lambda Functions:        0
+  Lex Bots:                0
+
+CONTACT FLOWS (20)
+─────────────────────────────────────────────────────────────────────
+  CONTACT_FLOW (10):
+    • Default agent transfer
+    • Default customer queue
+    • Main IVR Flow
+    • Sales Routing
+    • Support Routing
+    ...
+  
+  CUSTOMER_QUEUE (3):
+    • Default customer queue
+    • Priority Queue Flow
+    • Callback Queue Flow
+
+QUEUES (4)
+─────────────────────────────────────────────────────────────────────
+  • BasicQueue (Hours: Basic Hours)
+  • Sales (Hours: Sales Hours)
+  • Support (Hours: 24/7 Support)
+  • Billing (Hours: Business Hours)
+
+PROMPTS (7)
+─────────────────────────────────────────────────────────────────────
+  • Beep.wav
+  • CustomerHold.wav
+  • CustomerQueue.wav
+  • Music_Jazz_MyTimetoFly_Inst.wav
+  • Music_Pop_ThisAndThatIsLife_Inst.wav
+  • Music_Pop_ThrowYourselfInFrontOfIt_Inst.wav
+  • Music_Rock_EverywhereTheSunShines_Inst.wav
+
+═══════════════════════════════════════════════════════════════════
+
+Would you like more details on any specific resource type?
+  1. List all contact flows with descriptions
+  2. Show security profile permissions
+  3. View routing profile queue assignments
+  4. Export full configuration to JSON
+```
+
+---
+
+## Agent Troubleshooting
+
+The agent handles common issues automatically:
 
 | Issue | Agent Response |
 |-------|----------------|
-| Instance not found | Lists available instances, asks user to select |
-| Permission denied | Checks credentials, suggests IAM permissions |
-| Resource creation failed | Explains error, suggests workarounds |
-| Unsupported dependencies | Explains which flows have Lambda/Lex, offers to skip |
-| JSON parsing error | Handles automatically (fixed in v2.0) |
+| **Instance not found** | Lists available instances, asks user to select |
+| **Permission denied** | Checks credentials, suggests required IAM permissions |
+| **Instance creation failed** | Explains error (quota limit, naming conflict, invalid region) |
+| **Resource creation failed** | Explains specific error, suggests workarounds |
+| **Unsupported dependencies** | Lists flows with Lambda/Lex/prompt refs, offers to skip |
+| **Region not supported** | Lists supported Connect regions |
+| **Quota exceeded** | Shows current usage vs limits |
+
+---
+
+## Output Artifacts
+
+Each replication run saves artifacts to `~/Downloads/acr-replication-runs/<runId>/`:
+
+| File | Description |
+|------|-------------|
+| `bundle.json` | Exported configuration (all 19 resource types) |
+| `import-report.json` | Detailed import results per resource |
+| `verify.json` | Post-import resource counts for verification |
 
 ---
 
@@ -343,7 +605,181 @@ Results (best-effort, with `--overwrite --continue-on-error --skip-unsupported`)
 
 That is "as close as possible" to a fast configuration sync using only primitive APIs, while safely skipping flows that require external dependencies.
 
+---
+
+## IAM Permissions
+
+### Minimum Permissions for Replication
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ConnectReadSource",
+      "Effect": "Allow",
+      "Action": [
+        "connect:List*",
+        "connect:Describe*",
+        "connect:Get*",
+        "connect:Search*"
+      ],
+      "Resource": "arn:aws:connect:*:*:instance/*"
+    },
+    {
+      "Sid": "ConnectWriteTarget",
+      "Effect": "Allow",
+      "Action": [
+        "connect:Create*",
+        "connect:Update*",
+        "connect:Associate*"
+      ],
+      "Resource": "arn:aws:connect:*:*:instance/*"
+    }
+  ]
+}
+```
+
+### Additional Permissions for Instance Creation
+
+```json
+{
+  "Sid": "ConnectInstanceManagement",
+  "Effect": "Allow",
+  "Action": [
+    "connect:CreateInstance",
+    "connect:DeleteInstance",
+    "connect:DescribeInstance",
+    "connect:ListInstances"
+  ],
+  "Resource": "*"
+}
+```
+
+### Additional Permissions for Prompt S3 Copy
+
+```json
+{
+  "Sid": "S3PromptCopy",
+  "Effect": "Allow",
+  "Action": [
+    "s3:GetObject",
+    "s3:PutObject"
+  ],
+  "Resource": [
+    "arn:aws:s3:::source-bucket/*",
+    "arn:aws:s3:::target-bucket/*"
+  ]
+}
+```
+
+---
+
+## Disaster Recovery Use Case
+
+For DR scenarios, use the agent to set up and maintain a standby instance:
+
+### Initial Setup
+
+```
+User: Create a DR instance for my production contact center
+
+Agent: I'll help you create a DR instance. Let me ask a few questions...
+[Guided instance creation]
+
+User: Now replicate configuration from my-prod-connect to the new DR instance
+
+Agent: Replicating 19 resource types...
+[Detailed replication with summary]
+```
+
+### Regular Sync (Scheduled)
+
+```bash
+# Add to cron or scheduled task
+python3 ~/.copilot/skills/connect-instance-replication/scripts/connect_instance_replication.py replicate \
+  --source-region us-east-1 --source-alias my-prod-connect \
+  --target-region us-west-2 --target-alias my-dr-connect \
+  --overwrite --skip-unsupported --continue-on-error --yes
+```
+
+### Failover Checklist
+
+1. ✅ DR instance is ACTIVE (verify with `Describe my-dr-connect`)
+2. ✅ Configuration is synced (verify resource counts match)
+3. ✅ Phone numbers claimed in DR region
+4. ✅ Update DNS/routing to point to DR instance
+5. ✅ Notify agents to log into DR instance
+
+---
+
+## Supported AWS Regions
+
+Amazon Connect is available in these regions:
+
+| Region | Name |
+|--------|------|
+| us-east-1 | US East (N. Virginia) |
+| us-west-2 | US West (Oregon) |
+| eu-west-2 | Europe (London) |
+| eu-central-1 | Europe (Frankfurt) |
+| ap-southeast-1 | Asia Pacific (Singapore) |
+| ap-southeast-2 | Asia Pacific (Sydney) |
+| ap-northeast-1 | Asia Pacific (Tokyo) |
+| ap-northeast-2 | Asia Pacific (Seoul) |
+| ca-central-1 | Canada (Central) |
+| af-south-1 | Africa (Cape Town) |
+
+---
+
 ## References
-- Admin guide (flow import/export): https://docs.aws.amazon.com/connect/latest/adminguide/contact-flow-import-export.html
-- API Operations list: https://docs.aws.amazon.com/connect/latest/APIReference/API_Operations_Amazon_Connect_Service.html
-- Best practices for using Amazon Connect APIs: https://docs.aws.amazon.com/connect/latest/APIReference/best-practices-connect-apis.html
+
+- [Amazon Connect Admin Guide](https://docs.aws.amazon.com/connect/latest/adminguide/)
+- [Contact Flow Import/Export](https://docs.aws.amazon.com/connect/latest/adminguide/contact-flow-import-export.html)
+- [Connect API Reference](https://docs.aws.amazon.com/connect/latest/APIReference/API_Operations_Amazon_Connect_Service.html)
+- [Best Practices for Connect APIs](https://docs.aws.amazon.com/connect/latest/APIReference/best-practices-connect-apis.html)
+- [Connect CloudFormation Reference](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/AWS_Connect.html)
+
+---
+
+## Repository Structure
+
+```
+amazon-connect-replicator/
+├── README.md                              # This file
+├── package.json                           # Node.js dependencies
+├── packages/
+│   ├── api/                               # Express API server
+│   │   └── src/
+│   │       └── routes/connect.ts          # Connect API endpoints
+│   └── ui/                                # React UI
+│       └── src/
+│           └── components/                # UI components
+├── tools/
+│   └── connect-instance-replicator/       # Python CLI (main tool)
+│       ├── README.md
+│       └── connect_instance_replicate.py  # Export/import logic
+└── copilot-skills/
+    ├── connect-instance-replication/      # Copilot skill wrapper
+    │   ├── SKILL.md
+    │   └── scripts/
+    │       └── connect_instance_replication.py
+    └── connect-replication-agent/         # Interactive AI agent
+        └── SKILL.md                       # Agent definition
+```
+
+---
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Run tests (if applicable)
+5. Submit a pull request
+
+---
+
+## License
+
+MIT License - see LICENSE file for details.
