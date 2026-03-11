@@ -75,7 +75,8 @@ Provision your target instance in advance (via Console, CLI, or IaC), then use t
 | `packages/ui` | React UI wizard to pick regions/instances, export a bundle, and import it |
 | `tools/connect-instance-replicator` | Python CLI (boto3) to export/import bundles (recommended for automation) |
 | `copilot-skills/connect-instance-replication` | Copilot Skill wrapper for on-demand replication |
-| `copilot-skills/connect-replication-agent` | **NEW:** Interactive AI Agent for guided replication |
+| `copilot-skills/connect-replication-agent` | Interactive AI Agent for guided replication |
+| `copilot-skills/connect-campaign-agent` | **NEW:** Smart Campaign Agent for outbound campaigns |
 
 ## Supported resources (bundle v3.2 — 19 resource types)
 
@@ -607,7 +608,170 @@ That is "as close as possible" to a fast configuration sync using only primitive
 
 ---
 
-## IAM Permissions
+## 🚀 Smart Campaign Agent (Outbound Campaigns)
+
+The **connect-campaign-agent** is a comprehensive AI agent for building and managing intelligent outbound campaigns in Amazon Connect. It guides users through the complete campaign lifecycle:
+
+**SEGMENT → CREATE → PERSONALIZE → DEPLOY → MONITOR → OPTIMIZE**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                      SMART CAMPAIGN AGENT                                        │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  ┌──────────┐  ┌──────────┐  ┌───────────┐  ┌──────────┐  ┌──────────┐         │
+│  │ SEGMENT  │→ │  CREATE  │→ │PERSONALIZE│→ │  DEPLOY  │→ │ MONITOR  │         │
+│  │          │  │          │  │           │  │          │  │          │         │
+│  │ Build AI │  │ Campaign │  │ Bedrock   │  │ API/CFn  │  │ Contact  │         │
+│  │ segments │  │  config  │  │  scripts  │  │  deploy  │  │  Lens    │         │
+│  └──────────┘  └──────────┘  └───────────┘  └──────────┘  └──────────┘         │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Installation
+
+```bash
+# Install the campaign agent
+cp -r copilot-skills/connect-campaign-agent ~/.copilot/skills/
+
+# Verify installation
+ls ~/.copilot/skills/connect-campaign-agent/
+# Should show: SKILL.md, scripts/, templates/, examples/
+```
+
+### Capabilities
+
+| Module | Description | Features |
+|--------|-------------|----------|
+| **DISCOVER** | Find resources | List instances, campaigns, segments |
+| **SEGMENT** | Build segments | Natural language, Spark SQL, calculated attributes |
+| **CREATE** | Configure campaigns | 4 dialer modes, multi-channel, compliance |
+| **PERSONALIZE** | Generate content | Bedrock scripts, summaries, SMS templates |
+| **DEPLOY** | Launch campaigns | API, CloudFormation, lifecycle management |
+| **MONITOR** | Track performance | Contact Lens, real-time metrics, sentiment |
+| **OPTIMIZE** | AI recommendations | Timing, scripts, segments, agents |
+
+### Dialer Modes
+
+| Mode | Description | Best For |
+|------|-------------|----------|
+| **Predictive** | ML-powered pacing | High-volume sales, collections |
+| **Progressive** | 1:1 agent ratio | Regulated industries |
+| **Preview** | Agent sees context first | Complex/sensitive calls |
+| **Agentless** | Automated messages | Reminders, notifications |
+
+### Campaign Agent Commands
+
+| Action | Example |
+|--------|---------|
+| **List Campaigns** | `Show campaigns in my-prod-connect` |
+| **Create Segment** | `Create a segment of high-value customers who haven't ordered in 60 days` |
+| **Create Campaign** | `Create a collections campaign with preview dialer` |
+| **Personalize** | `Generate personalized scripts for my collections campaign` |
+| **Deploy** | `Start campaign Q2-Collections-2026` |
+| **Monitor** | `Show metrics for campaign Q2-Collections-2026` |
+| **Optimize** | `How can I improve my collections campaign?` |
+
+### TCPA Compliance (Built-In)
+
+The campaign agent enforces TCPA compliance automatically:
+
+- ✅ **Timezone restrictions**: 8am-9pm local time
+- ✅ **Communication limits**: Configurable max contacts per day/week
+- ✅ **Answering Machine Detection**: Voicemail handling
+- ✅ **DNC integration**: Do-not-call list checking
+- ✅ **Consent tracking**: Opt-in/opt-out management
+
+### Example Session: Create Collections Campaign
+
+```
+User: Create a collections campaign with preview dialer
+
+Agent: I'll help you create a collections campaign. Let me gather configuration:
+
+1. Campaign name? > Q2-Collections-2026
+2. Target segment? > overdue_30_plus (2,341 customers)
+3. Channel(s)? > Voice + SMS
+4. TCPA settings:
+   - Call window: 8am-9pm local
+   - Max 3 attempts/day
+   - AMD enabled (leave voicemail)
+
+Creating campaign...
+
+✅ Campaign Created!
+   ID: camp-xyz789
+   Status: STOPPED (ready to start)
+
+Say "Start campaign Q2-Collections-2026" to begin dialing.
+```
+
+### CloudFormation Templates
+
+Pre-built templates in `copilot-skills/connect-campaign-agent/templates/`:
+
+| Template | Description |
+|----------|-------------|
+| `campaign-infrastructure.yaml` | Basic campaign with best practices |
+| `segment-example.yaml` | Segment definition reference |
+| `campaign-with-compliance.yaml` | Full TCPA compliance settings |
+
+### Example Scripts
+
+Python examples in `copilot-skills/connect-campaign-agent/examples/`:
+
+| Script | Description |
+|--------|-------------|
+| `create_simple_campaign.py` | Basic campaign creation |
+| `create_segment.py` | AI-powered segment builder |
+| `personalize_script.py` | Bedrock content generation |
+
+### Prerequisites for Campaign Agent
+
+1. **Amazon Connect instance** with outbound campaigns enabled
+2. **Customer Profiles domain** configured (for segmentation)
+3. **Contact Lens enabled** (for analytics)
+4. **Amazon Bedrock access** (for personalization)
+5. **IAM permissions** for Outbound Campaigns V2 API
+
+### Additional IAM Permissions (Campaigns)
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "OutboundCampaigns",
+      "Effect": "Allow",
+      "Action": [
+        "connect-campaigns:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CustomerProfiles",
+      "Effect": "Allow",
+      "Action": [
+        "profile:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "BedrockPersonalization",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+See: [`copilot-skills/connect-campaign-agent/SKILL.md`](copilot-skills/connect-campaign-agent/SKILL.md)
+
+---
 
 ### Minimum Permissions for Replication
 
@@ -764,8 +928,20 @@ amazon-connect-replicator/
     │   ├── SKILL.md
     │   └── scripts/
     │       └── connect_instance_replication.py
-    └── connect-replication-agent/         # Interactive AI agent
-        └── SKILL.md                       # Agent definition
+    ├── connect-replication-agent/         # Interactive AI agent
+    │   └── SKILL.md                       # Agent definition
+    └── connect-campaign-agent/            # NEW: Smart Campaign Agent
+        ├── SKILL.md                       # Full agent documentation
+        ├── scripts/
+        │   └── smart_campaign_agent.py    # Main campaign tool
+        ├── templates/
+        │   ├── campaign-infrastructure.yaml
+        │   ├── segment-example.yaml
+        │   └── campaign-with-compliance.yaml
+        └── examples/
+            ├── create_simple_campaign.py
+            ├── create_segment.py
+            └── personalize_script.py
 ```
 
 ---

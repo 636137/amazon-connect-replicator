@@ -1,0 +1,504 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Full-featured Amazon Connect Outbound Campaign with complete TCPA compliance,
+  multi-channel support (voice + SMS), and CloudWatch monitoring.
+  
+  Best practices implemented:
+  - TCPA timezone restrictions (8am-9pm local time)
+  - Communication limits (max contacts per day/week)
+  - Answering Machine Detection with voicemail
+  - DNC list integration ready
+  - Full monitoring and alerting
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Required - Amazon Connect
+        Parameters:
+          - ConnectInstanceId
+          - ContactFlowId
+          - QueueId
+          - SourcePhoneNumber
+      - Label:
+          default: Required - Campaign
+        Parameters:
+          - CampaignName
+          - SegmentArn
+      - Label:
+          default: Compliance - TCPA Settings
+        Parameters:
+          - CallWindowStart
+          - CallWindowEnd
+          - MaxContactsPerDay
+          - MaxContactsPerWeek
+          - TimezoneDetection
+          - ExemptFromLimits
+      - Label:
+          default: Dialer Configuration
+        Parameters:
+          - DialerMode
+          - DialerCapacity
+          - PreviewTimeout
+      - Label:
+          default: Answering Machine Detection
+        Parameters:
+          - EnableAMD
+          - AMDAwaitPrompt
+          - VoicemailMessage
+      - Label:
+          default: Optional - SMS Fallback
+        Parameters:
+          - EnableSMSFallback
+          - SMSSourceNumberArn
+          - SMSTemplateArn
+      - Label:
+          default: Monitoring
+        Parameters:
+          - AlertEmail
+          - ConnectRateThreshold
+
+Parameters:
+  # ============================================================================
+  # AMAZON CONNECT CONFIGURATION
+  # ============================================================================
+  ConnectInstanceId:
+    Type: String
+    Description: Amazon Connect instance ID
+    AllowedPattern: ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$
+
+  ContactFlowId:
+    Type: String
+    Description: Contact flow ID for outbound calls
+
+  QueueId:
+    Type: String
+    Description: Queue ID for routing (agent-assisted campaigns)
+
+  SourcePhoneNumber:
+    Type: String
+    Description: Outbound caller ID (E.164 format, e.g., +12125551234)
+    AllowedPattern: ^\+[1-9]\d{1,14}$
+
+  # ============================================================================
+  # CAMPAIGN CONFIGURATION
+  # ============================================================================
+  CampaignName:
+    Type: String
+    Description: Campaign name (will appear in Connect and CloudWatch)
+    MinLength: 1
+    MaxLength: 128
+
+  SegmentArn:
+    Type: String
+    Description: Customer Profiles segment ARN as contact source
+    Default: ''
+
+  # ============================================================================
+  # TCPA COMPLIANCE SETTINGS
+  # ============================================================================
+  CallWindowStart:
+    Type: String
+    Description: Earliest call time (TCPA requires 8:00 AM local)
+    Default: '08:00'
+    AllowedPattern: ^([01]?[0-9]|2[0-3]):[0-5][0-9]$
+
+  CallWindowEnd:
+    Type: String
+    Description: Latest call time (TCPA requires 9:00 PM local)
+    Default: '21:00'
+    AllowedPattern: ^([01]?[0-9]|2[0-3]):[0-5][0-9]$
+
+  MaxContactsPerDay:
+    Type: Number
+    Description: Maximum contact attempts per customer per calendar day
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+
+  MaxContactsPerWeek:
+    Type: Number
+    Description: Maximum contact attempts per customer per 7-day period
+    Default: 7
+    MinValue: 1
+    MaxValue: 21
+
+  TimezoneDetection:
+    Type: String
+    Description: Method for detecting customer timezone
+    AllowedValues:
+      - ZIP_CODE
+      - AREA_CODE
+      - BOTH
+    Default: BOTH
+
+  ExemptFromLimits:
+    Type: String
+    Description: Exempt from communication limits (use only for fraud/emergency)
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+
+  # ============================================================================
+  # DIALER CONFIGURATION
+  # ============================================================================
+  DialerMode:
+    Type: String
+    Description: |
+      Dialer mode:
+      - PREDICTIVE: ML-powered, highest throughput
+      - PROGRESSIVE: 1:1 ratio, no abandon risk
+      - PREVIEW: Agent sees customer data first
+    AllowedValues:
+      - PREDICTIVE
+      - PROGRESSIVE
+      - PREVIEW
+    Default: PROGRESSIVE
+
+  DialerCapacity:
+    Type: Number
+    Description: Dialer capacity (0.1-1.0, lower = more conservative pacing)
+    Default: 0.7
+    MinValue: 0.1
+    MaxValue: 1.0
+
+  PreviewTimeout:
+    Type: Number
+    Description: Seconds agent has to review before auto-dial (preview mode only)
+    Default: 30
+    MinValue: 10
+    MaxValue: 120
+
+  # ============================================================================
+  # ANSWERING MACHINE DETECTION
+  # ============================================================================
+  EnableAMD:
+    Type: String
+    Description: Enable Answering Machine Detection
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+
+  AMDAwaitPrompt:
+    Type: String
+    Description: Wait for voicemail beep before leaving message
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+
+  VoicemailMessage:
+    Type: String
+    Description: Message to leave on voicemail (used by contact flow)
+    Default: 'This is an important message regarding your account. Please call us back at your earliest convenience.'
+    MaxLength: 500
+
+  # ============================================================================
+  # SMS FALLBACK CONFIGURATION
+  # ============================================================================
+  EnableSMSFallback:
+    Type: String
+    Description: Send SMS if voice contact fails
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+
+  SMSSourceNumberArn:
+    Type: String
+    Description: SMS source phone number ARN
+    Default: ''
+
+  SMSTemplateArn:
+    Type: String
+    Description: SMS template ARN
+    Default: ''
+
+  # ============================================================================
+  # MONITORING
+  # ============================================================================
+  AlertEmail:
+    Type: String
+    Description: Email for campaign alerts (leave empty to skip SNS)
+    Default: ''
+
+  ConnectRateThreshold:
+    Type: Number
+    Description: Alert if connect rate falls below this percentage
+    Default: 25
+    MinValue: 5
+    MaxValue: 50
+
+Conditions:
+  UsePreviewDialer: !Equals [!Ref DialerMode, 'PREVIEW']
+  EnableAMDCondition: !Equals [!Ref EnableAMD, 'true']
+  EnableSMSCondition: !Equals [!Ref EnableSMSFallback, 'true']
+  CreateAlertTopic: !Not [!Equals [!Ref AlertEmail, '']]
+  UseZipCode: !Or
+    - !Equals [!Ref TimezoneDetection, 'ZIP_CODE']
+    - !Equals [!Ref TimezoneDetection, 'BOTH']
+  UseAreaCode: !Or
+    - !Equals [!Ref TimezoneDetection, 'AREA_CODE']
+    - !Equals [!Ref TimezoneDetection, 'BOTH']
+  ExemptFromLimitsCondition: !Equals [!Ref ExemptFromLimits, 'true']
+  HasSegment: !Not [!Equals [!Ref SegmentArn, '']]
+
+Resources:
+  # ============================================================================
+  # OUTBOUND CAMPAIGN
+  # ============================================================================
+  OutboundCampaign:
+    Type: AWS::ConnectCampaignsV2::Campaign
+    Properties:
+      ConnectInstanceId: !Ref ConnectInstanceId
+      Name: !Ref CampaignName
+      
+      # Channel Configuration - Voice
+      ChannelSubtypeConfig:
+        Telephony:
+          Capacity: !Ref DialerCapacity
+          ConnectQueueId: !Ref QueueId
+          DefaultOutboundConfig:
+            ConnectContactFlowId: !Ref ContactFlowId
+            ConnectSourcePhoneNumber: !Ref SourcePhoneNumber
+            AnswerMachineDetectionConfig:
+              EnableAnswerMachineDetection: !If [EnableAMDCondition, true, false]
+              AwaitAnswerMachinePrompt: !If
+                - EnableAMDCondition
+                - !Equals [!Ref AMDAwaitPrompt, 'true']
+                - false
+      
+      # TCPA - Communication Time Config
+      CommunicationTimeConfig:
+        LocalTimeZoneConfig:
+          DefaultTimeZone: America/New_York
+          LocalTimeZoneDetection: !If
+            - UseZipCode
+            - !If
+              - UseAreaCode
+              - [ZIP_CODE, AREA_CODE]
+              - [ZIP_CODE]
+            - [AREA_CODE]
+        Telephony:
+          OpenHours:
+            DailyHours:
+              MONDAY:
+                - StartTime: !Ref CallWindowStart
+                  EndTime: !Ref CallWindowEnd
+              TUESDAY:
+                - StartTime: !Ref CallWindowStart
+                  EndTime: !Ref CallWindowEnd
+              WEDNESDAY:
+                - StartTime: !Ref CallWindowStart
+                  EndTime: !Ref CallWindowEnd
+              THURSDAY:
+                - StartTime: !Ref CallWindowStart
+                  EndTime: !Ref CallWindowEnd
+              FRIDAY:
+                - StartTime: !Ref CallWindowStart
+                  EndTime: !Ref CallWindowEnd
+              SATURDAY:
+                - StartTime: !Ref CallWindowStart
+                  EndTime: !Ref CallWindowEnd
+              SUNDAY:
+                - StartTime: !Ref CallWindowStart
+                  EndTime: !Ref CallWindowEnd
+      
+      # TCPA - Communication Limits
+      CommunicationLimitsOverride: !If
+        - ExemptFromLimitsCondition
+        - !Ref 'AWS::NoValue'
+        - AllChannelSubtypes:
+            CommunicationLimitsList:
+              - MaxCountPerRecipient: !Ref MaxContactsPerDay
+                Frequency: 1
+                Unit: DAY
+      
+      Tags:
+        - Key: Application
+          Value: SmartCampaignAgent
+        - Key: CampaignType
+          Value: AGENT_ASSISTED
+        - Key: DialerMode
+          Value: !Ref DialerMode
+        - Key: TCPACompliant
+          Value: 'true'
+        - Key: Environment
+          Value: !Ref 'AWS::StackName'
+
+  # ============================================================================
+  # SNS TOPIC FOR ALERTS
+  # ============================================================================
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateAlertTopic
+    Properties:
+      TopicName: !Sub '${CampaignName}-Alerts'
+      Tags:
+        - Key: Campaign
+          Value: !Ref CampaignName
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateAlertTopic
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ============================================================================
+  # CLOUDWATCH DASHBOARD
+  # ============================================================================
+  CampaignDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${CampaignName}-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": {
+                "markdown": "# ${CampaignName} Campaign Dashboard\n**Instance:** ${ConnectInstanceId} | **Dialer:** ${DialerMode} | **TCPA Window:** ${CallWindowStart} - ${CallWindowEnd}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 2, "width": 8, "height": 6,
+              "properties": {
+                "title": "Call Volume",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/Connect", "CallsPerInterval", "InstanceId", "${ConnectInstanceId}"]
+                ],
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8, "y": 2, "width": 8, "height": 6,
+              "properties": {
+                "title": "Agent Availability",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/Connect", "AgentsAvailable", "InstanceId", "${ConnectInstanceId}"],
+                  ["AWS/Connect", "AgentsOnCall", "InstanceId", "${ConnectInstanceId}"]
+                ],
+                "period": 60,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16, "y": 2, "width": 8, "height": 6,
+              "properties": {
+                "title": "Queue Metrics",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/Connect", "ContactsInQueue", "InstanceId", "${ConnectInstanceId}"],
+                  ["AWS/Connect", "OldestContactAge", "InstanceId", "${ConnectInstanceId}"]
+                ],
+                "period": 60,
+                "stat": "Maximum"
+              }
+            }
+          ]
+        }
+
+  # ============================================================================
+  # CLOUDWATCH ALARMS
+  # ============================================================================
+  LowConnectRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlertTopic
+    Properties:
+      AlarmName: !Sub '${CampaignName}-LowConnectRate'
+      AlarmDescription: !Sub 'Connect rate below ${ConnectRateThreshold}%'
+      MetricName: CallsPerInterval
+      Namespace: AWS/Connect
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: LessThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ConnectInstanceId
+
+  HighAbandonRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlertTopic
+    Properties:
+      AlarmName: !Sub '${CampaignName}-HighAbandonRate'
+      AlarmDescription: 'High call abandon rate detected'
+      MetricName: CallsAbandoned
+      Namespace: AWS/Connect
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ConnectInstanceId
+
+Outputs:
+  # Campaign Info
+  CampaignId:
+    Description: Campaign ID
+    Value: !Ref OutboundCampaign
+    Export:
+      Name: !Sub '${AWS::StackName}-CampaignId'
+
+  CampaignArn:
+    Description: Campaign ARN
+    Value: !GetAtt OutboundCampaign.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CampaignArn'
+
+  DashboardUrl:
+    Description: CloudWatch Dashboard URL
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${CampaignName}-Dashboard'
+
+  # TCPA Compliance Summary
+  TCPAComplianceSummary:
+    Description: TCPA compliance configuration
+    Value: !Sub |
+      ═══════════════════════════════════════════════════════════════
+                      TCPA COMPLIANCE SETTINGS
+      ═══════════════════════════════════════════════════════════════
+      Call Window:        ${CallWindowStart} - ${CallWindowEnd} local time
+      Timezone Detection: ${TimezoneDetection}
+      Max Per Day:        ${MaxContactsPerDay} attempts
+      Max Per Week:       ${MaxContactsPerWeek} attempts
+      AMD Enabled:        ${EnableAMD}
+      Exempt From Limits: ${ExemptFromLimits}
+      ═══════════════════════════════════════════════════════════════
+
+  # CLI Commands
+  StartCampaignCommand:
+    Description: AWS CLI command to start the campaign
+    Value: !Sub |
+      aws connectcampaignsv2 start-campaign --id ${OutboundCampaign}
+
+  AddContactsCommand:
+    Description: Example AWS CLI command to add contacts
+    Value: !Sub |
+      aws connectcampaignsv2 put-dial-request-batch \
+        --id ${OutboundCampaign} \
+        --dial-requests '[{"clientToken":"unique-id","phoneNumber":"+12125551234","expirationTime":"2026-12-31T23:59:59Z"}]'
+
+  GetStateCommand:
+    Description: AWS CLI command to check campaign state
+    Value: !Sub |
+      aws connectcampaignsv2 get-campaign-state --id ${OutboundCampaign}

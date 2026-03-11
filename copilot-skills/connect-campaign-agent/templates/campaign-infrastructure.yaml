@@ -1,0 +1,293 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Amazon Connect Outbound Campaign Infrastructure
+  Deploys a complete campaign with TCPA compliance settings, 
+  multi-channel support, and monitoring.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Amazon Connect Configuration
+        Parameters:
+          - ConnectInstanceId
+          - ContactFlowId
+          - QueueId
+          - SourcePhoneNumber
+      - Label:
+          default: Campaign Settings
+        Parameters:
+          - CampaignName
+          - CampaignType
+          - DialerMode
+      - Label:
+          default: Compliance Settings
+        Parameters:
+          - CallWindowStart
+          - CallWindowEnd
+          - MaxContactsPerDay
+          - EnableAMD
+      - Label:
+          default: Optional - SMS Configuration
+        Parameters:
+          - EnableSMS
+          - SMSSourceNumber
+          - SMSTemplateArn
+
+Parameters:
+  # Connect Configuration
+  ConnectInstanceId:
+    Type: String
+    Description: Amazon Connect instance ID (e.g., xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+    AllowedPattern: ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$
+    ConstraintDescription: Must be a valid UUID
+
+  ContactFlowId:
+    Type: String
+    Description: Contact flow ID for outbound calls
+    AllowedPattern: ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$
+
+  QueueId:
+    Type: String
+    Description: Queue ID for agent-assisted campaigns (leave empty for agentless)
+    Default: ''
+
+  SourcePhoneNumber:
+    Type: String
+    Description: Outbound caller ID phone number (E.164 format)
+    AllowedPattern: ^\+[1-9]\d{1,14}$
+    ConstraintDescription: Must be in E.164 format (e.g., +12125551234)
+
+  # Campaign Settings
+  CampaignName:
+    Type: String
+    Description: Campaign name
+    MinLength: 1
+    MaxLength: 128
+    Default: MyOutboundCampaign
+
+  CampaignType:
+    Type: String
+    Description: Campaign type
+    AllowedValues:
+      - AGENT_ASSISTED
+      - AGENTLESS
+    Default: AGENT_ASSISTED
+
+  DialerMode:
+    Type: String
+    Description: Dialer mode for agent-assisted campaigns
+    AllowedValues:
+      - PREDICTIVE
+      - PROGRESSIVE
+      - PREVIEW
+    Default: PROGRESSIVE
+
+  # Compliance Settings (TCPA)
+  CallWindowStart:
+    Type: String
+    Description: Earliest call time (HH:MM in 24-hour format)
+    Default: '08:00'
+    AllowedPattern: ^([01]?[0-9]|2[0-3]):[0-5][0-9]$
+
+  CallWindowEnd:
+    Type: String
+    Description: Latest call time (HH:MM in 24-hour format)
+    Default: '21:00'
+    AllowedPattern: ^([01]?[0-9]|2[0-3]):[0-5][0-9]$
+
+  MaxContactsPerDay:
+    Type: Number
+    Description: Maximum contact attempts per customer per day (TCPA compliance)
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+
+  EnableAMD:
+    Type: String
+    Description: Enable Answering Machine Detection
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+
+  # SMS Configuration (Optional)
+  EnableSMS:
+    Type: String
+    Description: Enable SMS channel
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+
+  SMSSourceNumber:
+    Type: String
+    Description: SMS source phone number ARN (required if EnableSMS is true)
+    Default: ''
+
+  SMSTemplateArn:
+    Type: String
+    Description: SMS template ARN (required if EnableSMS is true)
+    Default: ''
+
+Conditions:
+  HasQueue: !Not [!Equals [!Ref QueueId, '']]
+  IsAgentAssisted: !Equals [!Ref CampaignType, 'AGENT_ASSISTED']
+  UsePreviewDialer: !Equals [!Ref DialerMode, 'PREVIEW']
+  EnableAMDCondition: !Equals [!Ref EnableAMD, 'true']
+  EnableSMSCondition: !Equals [!Ref EnableSMS, 'true']
+
+Resources:
+  # ============================================================================
+  # OUTBOUND CAMPAIGN
+  # ============================================================================
+  OutboundCampaign:
+    Type: AWS::ConnectCampaignsV2::Campaign
+    Properties:
+      ConnectInstanceId: !Ref ConnectInstanceId
+      Name: !Ref CampaignName
+      
+      # Channel Configuration
+      ChannelSubtypeConfig:
+        Telephony:
+          Capacity: !If [UsePreviewDialer, 1.0, 0.7]
+          ConnectQueueId: !If [HasQueue, !Ref QueueId, !Ref 'AWS::NoValue']
+          DefaultOutboundConfig:
+            ConnectContactFlowId: !Ref ContactFlowId
+            ConnectSourcePhoneNumber: !Ref SourcePhoneNumber
+            AnswerMachineDetectionConfig:
+              EnableAnswerMachineDetection: !If [EnableAMDCondition, true, false]
+              AwaitAnswerMachinePrompt: !If [EnableAMDCondition, true, false]
+      
+      # TCPA Compliance - Communication Time Config
+      CommunicationTimeConfig:
+        LocalTimeZoneConfig:
+          DefaultTimeZone: America/New_York
+          LocalTimeZoneDetection:
+            - ZIP_CODE
+            - AREA_CODE
+        Telephony:
+          OpenHours:
+            DailyHours:
+              MONDAY:
+                - StartTime: !Ref CallWindowStart
+                  EndTime: !Ref CallWindowEnd
+              TUESDAY:
+                - StartTime: !Ref CallWindowStart
+                  EndTime: !Ref CallWindowEnd
+              WEDNESDAY:
+                - StartTime: !Ref CallWindowStart
+                  EndTime: !Ref CallWindowEnd
+              THURSDAY:
+                - StartTime: !Ref CallWindowStart
+                  EndTime: !Ref CallWindowEnd
+              FRIDAY:
+                - StartTime: !Ref CallWindowStart
+                  EndTime: !Ref CallWindowEnd
+              SATURDAY:
+                - StartTime: !Ref CallWindowStart
+                  EndTime: !Ref CallWindowEnd
+              SUNDAY:
+                - StartTime: !Ref CallWindowStart
+                  EndTime: !Ref CallWindowEnd
+      
+      # TCPA Compliance - Communication Limits
+      CommunicationLimitsOverride:
+        AllChannelSubtypes:
+          CommunicationLimitsList:
+            - MaxCountPerRecipient: !Ref MaxContactsPerDay
+              Frequency: 1
+              Unit: DAY
+      
+      # Tags
+      Tags:
+        - Key: Application
+          Value: SmartCampaignAgent
+        - Key: CampaignType
+          Value: !Ref CampaignType
+        - Key: DialerMode
+          Value: !Ref DialerMode
+        - Key: Environment
+          Value: !Ref 'AWS::StackName'
+
+  # ============================================================================
+  # CLOUDWATCH ALARMS
+  # ============================================================================
+  CampaignErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${CampaignName}-ErrorRate'
+      AlarmDescription: High error rate in outbound campaign
+      MetricName: CallsPerInterval
+      Namespace: AWS/Connect
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: LessThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ConnectInstanceId
+      Tags:
+        - Key: Campaign
+          Value: !Ref CampaignName
+
+  # ============================================================================
+  # LAMBDA FUNCTION (Optional - for custom personalization)
+  # ============================================================================
+  # PersonalizationFunction:
+  #   Type: AWS::Lambda::Function
+  #   Properties:
+  #     FunctionName: !Sub '${CampaignName}-Personalization'
+  #     Runtime: python3.11
+  #     Handler: index.handler
+  #     Role: !GetAtt PersonalizationFunctionRole.Arn
+  #     Timeout: 30
+  #     MemorySize: 256
+  #     Code:
+  #       ZipFile: |
+  #         import json
+  #         import boto3
+  #         
+  #         def handler(event, context):
+  #             # Custom personalization logic
+  #             customer_data = event.get('Details', {}).get('Parameters', {})
+  #             return {
+  #                 'greeting': f"Hello {customer_data.get('name', 'there')}",
+  #                 'personalized': True
+  #             }
+
+Outputs:
+  CampaignId:
+    Description: Campaign ID
+    Value: !Ref OutboundCampaign
+    Export:
+      Name: !Sub '${AWS::StackName}-CampaignId'
+
+  CampaignArn:
+    Description: Campaign ARN
+    Value: !GetAtt OutboundCampaign.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CampaignArn'
+
+  ConnectInstanceId:
+    Description: Connect Instance ID
+    Value: !Ref ConnectInstanceId
+
+  CampaignSettings:
+    Description: Campaign settings summary
+    Value: !Sub |
+      Name: ${CampaignName}
+      Type: ${CampaignType}
+      Dialer: ${DialerMode}
+      Call Window: ${CallWindowStart} - ${CallWindowEnd}
+      Max Contacts/Day: ${MaxContactsPerDay}
+      AMD: ${EnableAMD}
+
+  NextSteps:
+    Description: Next steps after deployment
+    Value: |
+      1. Start the campaign: aws connectcampaignsv2 start-campaign --id <CampaignId>
+      2. Add contacts: aws connectcampaignsv2 put-dial-request-batch --id <CampaignId> --dial-requests [...]
+      3. Monitor: aws connectcampaignsv2 get-campaign-state --id <CampaignId>

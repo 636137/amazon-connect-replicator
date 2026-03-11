@@ -1,0 +1,146 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Example segment definition for Customer Profiles
+  This template shows how to structure segment configurations.
+  Note: Actual deployment may require the Customer Profiles console or API.
+
+Metadata:
+  Documentation:
+    Overview: |
+      This is a reference template showing segment configuration patterns.
+      Customer Profiles segments can be created using:
+      1. AWS Console (Customer Profiles > Segments)
+      2. CreateSegmentDefinition API
+      3. Segment AI Assistant (natural language)
+      4. Spark SQL queries
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: Customer Profiles domain name
+    MinLength: 1
+    MaxLength: 64
+
+  SegmentName:
+    Type: String
+    Description: Unique segment identifier
+    Default: high-value-dormant-customers
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Lowercase letters, numbers, and hyphens only
+
+  SegmentDisplayName:
+    Type: String
+    Description: Human-readable segment name
+    Default: High-Value Dormant Customers
+
+  LifetimeValueThreshold:
+    Type: Number
+    Description: Minimum lifetime value for inclusion
+    Default: 10000
+    MinValue: 0
+
+  DaysSinceLastOrder:
+    Type: Number
+    Description: Minimum days since last order (dormancy threshold)
+    Default: 60
+    MinValue: 1
+
+Resources:
+  # ============================================================================
+  # SEGMENT DEFINITION (Reference - use API/Console for actual deployment)
+  # ============================================================================
+  # Note: AWS::CustomerProfiles::SegmentDefinition is not yet available as 
+  # a CloudFormation resource. This serves as documentation for the API call.
+  
+  # Equivalent API call:
+  # aws customer-profiles create-segment-definition \
+  #   --domain-name <DomainName> \
+  #   --segment-definition-name <SegmentName> \
+  #   --display-name <SegmentDisplayName> \
+  #   --segment-groups '{...}'
+
+  # Placeholder custom resource (requires Lambda implementation)
+  SegmentDefinitionPlaceholder:
+    Type: AWS::CloudFormation::WaitConditionHandle
+    Metadata:
+      SegmentConfiguration:
+        DomainName: !Ref DomainName
+        SegmentDefinitionName: !Ref SegmentName
+        DisplayName: !Ref SegmentDisplayName
+        Description: !Sub |
+          Customers with lifetime value > $${LifetimeValueThreshold}
+          who have not ordered in ${DaysSinceLastOrder}+ days.
+          Used for reactivation campaigns.
+        
+        # Audience Group Configuration
+        SegmentGroups:
+          Groups:
+            - Dimensions:
+                - ProfileAttributes:
+                    - Dimension: INCLUSIVE
+                      Attribute:
+                        Name: lifetime_value
+                        Operator: GREATER_THAN
+                        Value: !Ref LifetimeValueThreshold
+                - ProfileAttributes:
+                    - Dimension: INCLUSIVE
+                      Attribute:
+                        Name: days_since_last_order
+                        Operator: GREATER_THAN
+                        Value: !Ref DaysSinceLastOrder
+                - ProfileAttributes:
+                    - Dimension: INCLUSIVE
+                      Attribute:
+                        Name: opt_in_status
+                        Operator: EQUAL
+                        Value: "OPTED_IN"
+              SourceSegments: []
+              SourceType: ALL
+              Type: ALL
+          Include: ALL
+
+        # Equivalent Spark SQL (for Segment AI Assistant)
+        SparkSQL: !Sub |
+          SELECT *
+          FROM CustomerProfiles
+          WHERE lifetime_value > ${LifetimeValueThreshold}
+            AND days_since_last_order > ${DaysSinceLastOrder}
+            AND opt_in_status = 'OPTED_IN'
+
+Outputs:
+  SegmentConfiguration:
+    Description: Segment configuration for API deployment
+    Value: !Sub |
+      Domain: ${DomainName}
+      Segment: ${SegmentName}
+      Display Name: ${SegmentDisplayName}
+      Criteria:
+        - Lifetime Value > $${LifetimeValueThreshold}
+        - Days Since Last Order > ${DaysSinceLastOrder}
+        - Opt-In Status = OPTED_IN
+
+  SparkSQLQuery:
+    Description: Spark SQL query for segment definition
+    Value: !Sub |
+      SELECT *
+      FROM CustomerProfiles
+      WHERE lifetime_value > ${LifetimeValueThreshold}
+        AND days_since_last_order > ${DaysSinceLastOrder}
+        AND opt_in_status = 'OPTED_IN'
+
+  APICommand:
+    Description: AWS CLI command to create this segment
+    Value: !Sub |
+      aws customer-profiles create-segment-definition \
+        --domain-name ${DomainName} \
+        --segment-definition-name ${SegmentName} \
+        --display-name "${SegmentDisplayName}" \
+        --description "High-value customers dormant for ${DaysSinceLastOrder}+ days" \
+        --segment-groups '{"Groups":[{"Dimensions":[...],"SourceType":"ALL","Type":"ALL"}],"Include":"ALL"}'
+
+  NaturalLanguagePrompt:
+    Description: Natural language prompt for Segment AI Assistant
+    Value: !Sub |
+      Create a segment of customers with lifetime value greater than 
+      $${LifetimeValueThreshold} who have not made a purchase in the 
+      last ${DaysSinceLastOrder} days and have opted in to communications.
