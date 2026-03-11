@@ -1,4 +1,6 @@
 import {
+  AssociateBotCommand,
+  AssociateLambdaFunctionCommand,
   ConnectClient,
   CreateContactFlowCommand,
   CreateContactFlowModuleCommand,
@@ -9,6 +11,7 @@ import {
   DescribeHoursOfOperationCommand,
   DescribeInstanceCommand,
   DescribeQueueCommand,
+  ListBotsCommand,
   ListContactFlowModulesCommand,
   ListContactFlowModulesCommandOutput,
   ListContactFlowsCommand,
@@ -16,6 +19,7 @@ import {
   ListHoursOfOperationsCommand,
   ListHoursOfOperationsCommandOutput,
   ListInstancesCommand,
+  ListLambdaFunctionsCommand,
   ListQueuesCommand,
   ListQueuesCommandOutput,
   UpdateContactFlowContentCommand,
@@ -95,6 +99,21 @@ type ExportedQueue = {
   tags?: Record<string, string>;
 };
 
+type ExportedLambdaFunction = {
+  arn: string;
+  region?: string;
+  accountId?: string;
+  functionName?: string;
+};
+
+type ExportedLexBot = {
+  aliasArn?: string;
+  name?: string;
+  lexVersion: string;
+  region?: string;
+  botName?: string;
+};
+
 type ExportBundleV1 = {
   version: 1;
   exportedAt: string;
@@ -103,6 +122,8 @@ type ExportBundleV1 = {
   queues?: ExportedQueue[];
   flowModules: ExportedFlowModule[];
   contactFlows: ExportedContactFlow[];
+  lambdaFunctions?: ExportedLambdaFunction[];
+  lexBots?: ExportedLexBot[];
 };
 
 function applyReplacements(content: string, replacements: Array<[string, string]>): string {
@@ -343,6 +364,71 @@ connectRouter.post("/export", async (req, res) => {
       });
     }
 
+    // Export Lambda functions
+    const lambdaFunctions: { arn: string; region?: string; accountId?: string; functionName?: string }[] = [];
+    try {
+      let nextToken: string | undefined;
+      do {
+        const resp = await c.send(new ListLambdaFunctionsCommand({ InstanceId: instanceId, NextToken: nextToken, MaxResults: 100 }));
+        for (const arn of resp.LambdaFunctions || []) {
+          if (arn) {
+            const parts = arn.split(":");
+            lambdaFunctions.push({
+              arn,
+              region: parts[3],
+              accountId: parts[4],
+              functionName: parts[6]
+            });
+          }
+        }
+        nextToken = resp.NextToken;
+      } while (nextToken);
+    } catch (e) {
+      console.warn("ListLambdaFunctions failed:", e);
+    }
+
+    // Export Lex bots (V2)
+    const lexBots: { aliasArn?: string; name?: string; lexVersion: string; region?: string; botName?: string }[] = [];
+    try {
+      let nextToken: string | undefined;
+      do {
+        const resp = await c.send(new ListBotsCommand({ InstanceId: instanceId, LexVersion: "V2", NextToken: nextToken, MaxResults: 100 }));
+        for (const bot of resp.LexBots || []) {
+          const aliasArn = (bot as any).LexBotAliasArn;
+          if (aliasArn) {
+            const parts = aliasArn.split(":");
+            lexBots.push({
+              aliasArn,
+              lexVersion: "V2",
+              region: parts[3],
+              botName: (bot as any).BotName
+            });
+          }
+        }
+        nextToken = resp.NextToken;
+      } while (nextToken);
+    } catch (e) {
+      console.warn("ListBots V2 failed:", e);
+    }
+
+    // Export Lex bots (V1)
+    try {
+      let nextToken: string | undefined;
+      do {
+        const resp = await c.send(new ListBotsCommand({ InstanceId: instanceId, LexVersion: "V1", NextToken: nextToken, MaxResults: 100 }));
+        for (const bot of resp.LexBots || []) {
+          lexBots.push({
+            name: (bot as any).Name,
+            lexVersion: "V1",
+            region: (bot as any).LexRegion
+          });
+        }
+        nextToken = resp.NextToken;
+      } while (nextToken);
+    } catch (e) {
+      console.warn("ListBots V1 failed:", e);
+    }
+
     const bundle: ExportBundleV1 = {
       version: 1,
       exportedAt: new Date().toISOString(),
@@ -350,7 +436,9 @@ connectRouter.post("/export", async (req, res) => {
       hoursOfOperations,
       queues: exportedQueues,
       flowModules,
-      contactFlows
+      contactFlows,
+      lambdaFunctions,
+      lexBots
     };
 
     return res.status(200).json(bundle);
