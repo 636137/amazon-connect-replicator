@@ -1,6 +1,6 @@
 ---
 name: connect-instance-replication
-description: Replicate Amazon Connect instance configuration across regions using primitive APIs. Exports/imports 17 resource types into pre-existing target instances with selective resource control.
+description: Replicate Amazon Connect instance configuration across regions using primitive APIs. Exports/imports 19 resource types including Lambda/Lex with automatic ARN replacement.
 user-invocable: true
 disable-model-invocation: false
 ---
@@ -22,7 +22,7 @@ This skill **always replicates into a pre-existing target instance**. It does NO
 
 Provision your target instance in advance, then use this skill to sync configuration.
 
-## Bundle v3 Scope (17 resource types)
+## Bundle v3.1 Scope (19 resource types)
 
 The replicator exports and imports these resource types in dependency-aware order:
 
@@ -45,8 +45,26 @@ The replicator exports and imports these resource types in dependency-aware orde
 | 15 | Rules | Automation rules and triggers | CreateRule / UpdateRule |
 | 16 | Evaluation Forms | Quality management forms | CreateEvaluationForm |
 | 17 | Vocabularies | Custom speech recognition | CreateVocabulary |
+| 18 | **Lambda Functions** | Serverless integrations | ListLambdaFunctions / AssociateLambdaFunction |
+| 19 | **Lex Bots (V1/V2)** | Conversational AI bots | ListBots / AssociateBot / AssociateLexBot |
 
 ## Key Features
+
+### Lambda & Lex Auto-Discovery
+Automatically discovers Lambda functions and Lex bots associated with the source instance using:
+- `ListLambdaFunctions` - Gets all Lambda ARNs configured for flows
+- `ListBots` (V1 and V2) - Gets all Lex bot associations
+
+### Cross-Region ARN Replacement
+When replicating across regions, automatically rewrites ARNs in flow content:
+```
+arn:aws:lambda:us-east-1:123456789012:function:MyFunc
+                ↓
+arn:aws:lambda:us-west-2:123456789012:function:MyFunc
+```
+
+### Auto-Association
+Associates Lambda functions and Lex bots with the target instance so they appear in flow designer dropdowns.
 
 ### Selective Resource Replication
 Choose which resource types to replicate - all, one, or many. The UI provides checkboxes for each type; the CLI can filter via code.
@@ -207,7 +225,9 @@ Each run writes to `~/Downloads/acr-replication-runs/<runId>/`:
     "flowModules": { "created": 2, "updated": 5, "skipped": 0 },
     "contactFlows": { "created": 0, "updated": 21, "skipped": 0 },
     "predefinedAttributes": { "created": 5, "updated": 0, "skipped": 0 },
-    "taskTemplates": { "created": 3, "updated": 0, "skipped": 0 }
+    "taskTemplates": { "created": 3, "updated": 0, "skipped": 0 },
+    "lambdaFunctions": { "associated": 2, "skipped": 1, "failed": 0 },
+    "lexBots": { "associated": 1, "skipped": 0, "failed": 0 }
   },
   "durationMs": 45230
 }
@@ -224,7 +244,13 @@ For DR scenarios, pre-provision a target instance in your DR region:
      --instance-alias my-dr-connect --inbound-calls-enabled --outbound-calls-enabled
    ```
 
-2. **Regular sync (scheduled or on-demand):**
+2. **Deploy Lambda/Lex in target region:**
+   ```bash
+   # Lambda functions must exist in target region with same name
+   # Lex bots must be deployed in target region with same bot ID
+   ```
+
+3. **Regular sync (scheduled or on-demand):**
    ```bash
    python3 tools/connect-instance-replicator/connect_instance_replicate.py replicate \
      --source-region us-east-1 --source-alias my-prod-connect \
@@ -232,13 +258,49 @@ For DR scenarios, pre-provision a target instance in your DR region:
      --overwrite --yes
    ```
 
-3. **Failover:** Update DNS/routing to point to DR instance (instance ID is already known)
+4. **Failover:** Update DNS/routing to point to DR instance (instance ID is already known)
+
+## Lambda/Lex Replication Workflow
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        EXPORT PHASE                                  │
+├─────────────────────────────────────────────────────────────────────┤
+│  1. ListLambdaFunctions → Discovers Lambda ARNs                     │
+│  2. ListBots (V1/V2)    → Discovers Lex bot associations            │
+│  3. Export contact flows with embedded Lambda/Lex ARNs              │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│                        IMPORT PHASE                                  │
+├─────────────────────────────────────────────────────────────────────┤
+│  1. Build ARN replacement map (source region → target region)       │
+│  2. AssociateLambdaFunction → Register Lambda with target instance  │
+│  3. AssociateBot / AssociateLexBot → Register Lex with target       │
+│  4. Apply ARN replacements to all flow content                      │
+│  5. Create/Update flows with corrected ARNs                         │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## Prerequisites for Lambda/Lex
+
+For Lambda and Lex replication to succeed:
+
+1. **Lambda functions must exist in target region** with the same function name
+   - Deploy using SAM, CDK, or CloudFormation multi-region
+   - ARN changes only in the region portion
+
+2. **Lex V2 bots must exist in target region** with the same bot ID and alias ID
+   - Use Lex bot versioning and multi-region deployment
+   - Bot alias ARN changes only in the region portion
+
+3. **Lex V1 bots** (legacy) must be available in target region
 
 ## Limitations
 
 - **Users not replicated:** Agent users must be provisioned separately (SSO/SAML considerations)
 - **Phone numbers not replicated:** Must be claimed separately in target region
-- **Lambda/Lex integrations:** Flows referencing external services need those services deployed in target region
+- **Lambda/Lex must pre-exist:** The replicator associates and rewrites ARNs, but does NOT deploy Lambda/Lex resources
 - **Prompts require S3:** Audio files need an S3 bucket for cross-region copy
 
 ## GitHub Repository

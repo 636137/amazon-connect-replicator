@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Amazon Connect Instance Replicator (v3)
+Amazon Connect Instance Replicator (v3.1)
 Best-effort export/import of Connect configuration using primitive APIs.
 
-Bundle v3 scope:
+Bundle v3.1 scope:
   - Hours of Operation
   - Agent Statuses
   - Security Profiles
@@ -14,13 +14,15 @@ Bundle v3 scope:
   - Contact Flow Modules
   - Contact Flows
   - Instance Attributes
-  - Predefined Attributes (NEW)
-  - Prompts (NEW, with S3 copy)
-  - Task Templates (NEW)
-  - Views (NEW)
-  - Rules (NEW)
-  - Evaluation Forms (NEW)
-  - Vocabularies (NEW)
+  - Predefined Attributes
+  - Prompts (with S3 copy)
+  - Task Templates
+  - Views
+  - Rules
+  - Evaluation Forms
+  - Vocabularies
+  - Lambda Functions (discovery + association + ARN replacement)
+  - Lex Bots V1/V2 (discovery + association + ARN replacement)
 """
 
 import argparse
@@ -661,6 +663,65 @@ def _export_vocabularies(client, instance_id: str) -> List[Dict[str, Any]]:
     return vocabs
 
 
+def _export_lambda_functions(client, instance_id: str) -> List[Dict[str, Any]]:
+    """Export Lambda function associations from Connect instance."""
+    lambdas: List[Dict[str, Any]] = []
+    try:
+        for page in _paginate(client.list_lambda_functions, InstanceId=instance_id, MaxResults=100):
+            for arn in page.get("LambdaFunctions") or []:
+                if arn:
+                    # Parse ARN to extract function name and region
+                    # Format: arn:aws:lambda:us-east-1:123456789012:function:MyFunction
+                    parts = arn.split(":")
+                    lambdas.append({
+                        "arn": arn,
+                        "region": parts[3] if len(parts) > 3 else None,
+                        "accountId": parts[4] if len(parts) > 4 else None,
+                        "functionName": parts[6] if len(parts) > 6 else None,
+                    })
+    except ClientError as e:
+        print(f"WARN: list_lambda_functions not available or failed: {e}", file=sys.stderr)
+    return lambdas
+
+
+def _export_lex_bots(client, instance_id: str) -> List[Dict[str, Any]]:
+    """Export Lex bot associations from Connect instance (V1 and V2)."""
+    bots: List[Dict[str, Any]] = []
+    
+    # Try Lex V2 bots first
+    try:
+        for page in _paginate(client.list_bots, InstanceId=instance_id, LexVersion="V2", MaxResults=100):
+            for bot in page.get("LexBots") or []:
+                alias_arn = bot.get("LexBotAliasArn")
+                if alias_arn:
+                    # Parse ARN: arn:aws:lex:us-east-1:123456789012:bot-alias/BOTID/ALIASID
+                    parts = alias_arn.split(":")
+                    bots.append({
+                        "aliasArn": alias_arn,
+                        "lexVersion": "V2",
+                        "region": parts[3] if len(parts) > 3 else None,
+                        "accountId": parts[4] if len(parts) > 4 else None,
+                        "botAliasId": bot.get("BotAliasId"),
+                        "botName": bot.get("BotName"),
+                    })
+    except ClientError as e:
+        print(f"WARN: list_bots V2 not available or failed: {e}", file=sys.stderr)
+    
+    # Try Lex V1 bots
+    try:
+        for page in _paginate(client.list_bots, InstanceId=instance_id, LexVersion="V1", MaxResults=100):
+            for bot in page.get("LexBots") or []:
+                bots.append({
+                    "name": bot.get("Name"),
+                    "lexVersion": "V1",
+                    "lexRegion": bot.get("LexRegion"),
+                })
+    except ClientError as e:
+        print(f"WARN: list_bots V1 not available or failed: {e}", file=sys.stderr)
+    
+    return bots
+
+
 def export_bundle(*, profile: Optional[str], region: str, instance_id: str) -> Dict[str, Any]:
     client = _connect_client(profile, region)
 
@@ -682,6 +743,9 @@ def export_bundle(*, profile: Optional[str], region: str, instance_id: str) -> D
     rules = _export_rules(client, instance_id)
     evaluation_forms = _export_evaluation_forms(client, instance_id)
     vocabularies = _export_vocabularies(client, instance_id)
+    # V3.1 - External integrations discovery
+    lambda_functions = _export_lambda_functions(client, instance_id)
+    lex_bots = _export_lex_bots(client, instance_id)
 
     return {
         "version": 3,
@@ -705,6 +769,9 @@ def export_bundle(*, profile: Optional[str], region: str, instance_id: str) -> D
         "rules": rules,
         "evaluationForms": evaluation_forms,
         "vocabularies": vocabularies,
+        # V3.1 - External integrations
+        "lambdaFunctions": lambda_functions,
+        "lexBots": lex_bots,
     }
 
 
@@ -764,6 +831,45 @@ def import_bundle(
             replacements.append((src_id, dst_id))
         if src_arn and dst_arn:
             replacements.append((src_arn, dst_arn))
+
+    # -------------------------------------------------------------------------
+    # 0. Build Lambda/Lex ARN replacements (source region → target region)
+    # -------------------------------------------------------------------------
+    source_region = bundle.get("source", {}).get("region")
+    target_region = region
+    
+    lambda_arn_replacements: List[Tuple[str, str]] = []
+    lex_arn_replacements: List[Tuple[str, str]] = []
+    
+    # Lambda ARNs: replace source region with target region
+    # arn:aws:lambda:us-east-1:123456789012:function:MyFunc → arn:aws:lambda:us-west-2:...
+    for lf in bundle.get("lambdaFunctions") or []:
+        src_arn = lf.get("arn")
+        if src_arn and source_region and target_region != source_region:
+            target_arn = src_arn.replace(f":{source_region}:", f":{target_region}:")
+            lambda_arn_replacements.append((src_arn, target_arn))
+            print(f"  Lambda ARN mapping: {src_arn} → {target_arn}")
+    
+    # Lex V2 ARNs: replace source region with target region
+    # arn:aws:lex:us-east-1:123456789012:bot-alias/XXX/YYY → arn:aws:lex:us-west-2:...
+    for lb in bundle.get("lexBots") or []:
+        src_arn = lb.get("aliasArn")
+        if src_arn and source_region and target_region != source_region:
+            target_arn = src_arn.replace(f":{source_region}:", f":{target_region}:")
+            lex_arn_replacements.append((src_arn, target_arn))
+            print(f"  Lex V2 ARN mapping: {src_arn} → {target_arn}")
+        # Also handle Lex V1 region references in flow content
+        lex_region = lb.get("lexRegion")
+        if lex_region and lex_region != target_region:
+            # V1 bots reference region in flow content as "LexRegion": "us-east-1"
+            lex_arn_replacements.append((f'"LexRegion":"{lex_region}"', f'"LexRegion":"{target_region}"'))
+            lex_arn_replacements.append((f'"LexRegion": "{lex_region}"', f'"LexRegion": "{target_region}"'))
+    
+    # Add to main replacements list (these will be applied to all flow content)
+    replacements.extend(lambda_arn_replacements)
+    replacements.extend(lex_arn_replacements)
+    
+    print(f"Built {len(lambda_arn_replacements)} Lambda and {len(lex_arn_replacements)} Lex ARN replacements")
 
     # -------------------------------------------------------------------------
     # 1. Hours of Operation
@@ -1812,6 +1918,133 @@ def import_bundle(
                     raise
                 inc("failedVocabularies")
                 add_error("vocabularies", {"name": name, "action": "create", "error": str(e)})
+
+    # -------------------------------------------------------------------------
+    # 18. Associate Lambda Functions with Target Instance
+    # -------------------------------------------------------------------------
+    existing_lambdas: set = set()
+    try:
+        for page in _paginate(client.list_lambda_functions, InstanceId=instance_id, MaxResults=100):
+            for arn in page.get("LambdaFunctions") or []:
+                if arn:
+                    existing_lambdas.add(arn)
+    except ClientError:
+        pass
+
+    for lf in bundle.get("lambdaFunctions") or []:
+        src_arn = lf.get("arn")
+        if not src_arn:
+            continue
+        # Build target ARN by replacing region
+        target_arn = src_arn.replace(f":{source_region}:", f":{target_region}:") if source_region else src_arn
+        
+        if target_arn in existing_lambdas:
+            inc("skippedLambdas")
+            continue
+        
+        if dry_run:
+            inc("associatedLambdas")
+            continue
+        
+        try:
+            client.associate_lambda_function(InstanceId=instance_id, FunctionArn=target_arn)
+            inc("associatedLambdas")
+            print(f"  Associated Lambda: {target_arn}")
+        except ClientError as e:
+            # Lambda might not exist in target region
+            err_code = e.response.get("Error", {}).get("Code", "")
+            if err_code in ("ResourceNotFoundException", "InvalidParameterException"):
+                inc("failedLambdas")
+                add_error("lambdas", {"arn": target_arn, "action": "associate", "error": str(e)})
+                print(f"  WARN: Lambda not found in target region: {target_arn}", file=sys.stderr)
+            elif not continue_on_error:
+                raise
+            else:
+                inc("failedLambdas")
+                add_error("lambdas", {"arn": target_arn, "action": "associate", "error": str(e)})
+
+    # -------------------------------------------------------------------------
+    # 19. Associate Lex Bots with Target Instance
+    # -------------------------------------------------------------------------
+    existing_lex_v2: set = set()
+    existing_lex_v1: set = set()
+    try:
+        for page in _paginate(client.list_bots, InstanceId=instance_id, LexVersion="V2", MaxResults=100):
+            for bot in page.get("LexBots") or []:
+                if bot.get("LexBotAliasArn"):
+                    existing_lex_v2.add(bot["LexBotAliasArn"])
+    except ClientError:
+        pass
+    try:
+        for page in _paginate(client.list_bots, InstanceId=instance_id, LexVersion="V1", MaxResults=100):
+            for bot in page.get("LexBots") or []:
+                if bot.get("Name"):
+                    existing_lex_v1.add(bot["Name"])
+    except ClientError:
+        pass
+
+    for lb in bundle.get("lexBots") or []:
+        lex_version = lb.get("lexVersion")
+        
+        if lex_version == "V2":
+            src_arn = lb.get("aliasArn")
+            if not src_arn:
+                continue
+            target_arn = src_arn.replace(f":{source_region}:", f":{target_region}:") if source_region else src_arn
+            
+            if target_arn in existing_lex_v2:
+                inc("skippedLexBots")
+                continue
+            
+            if dry_run:
+                inc("associatedLexBots")
+                continue
+            
+            try:
+                client.associate_bot(InstanceId=instance_id, LexV2Bot={"AliasArn": target_arn})
+                inc("associatedLexBots")
+                print(f"  Associated Lex V2 bot: {target_arn}")
+            except ClientError as e:
+                err_code = e.response.get("Error", {}).get("Code", "")
+                if err_code in ("ResourceNotFoundException", "InvalidParameterException"):
+                    inc("failedLexBots")
+                    add_error("lexBots", {"arn": target_arn, "action": "associate", "error": str(e)})
+                    print(f"  WARN: Lex V2 bot not found in target region: {target_arn}", file=sys.stderr)
+                elif not continue_on_error:
+                    raise
+                else:
+                    inc("failedLexBots")
+                    add_error("lexBots", {"arn": target_arn, "action": "associate", "error": str(e)})
+        
+        elif lex_version == "V1":
+            bot_name = lb.get("name")
+            src_region = lb.get("lexRegion")
+            if not bot_name:
+                continue
+            
+            if bot_name in existing_lex_v1:
+                inc("skippedLexBots")
+                continue
+            
+            if dry_run:
+                inc("associatedLexBots")
+                continue
+            
+            try:
+                client.associate_lex_bot(InstanceId=instance_id, LexBot={"Name": bot_name, "LexRegion": target_region})
+                inc("associatedLexBots")
+                print(f"  Associated Lex V1 bot: {bot_name} in {target_region}")
+            except ClientError as e:
+                err_code = e.response.get("Error", {}).get("Code", "")
+                if err_code in ("ResourceNotFoundException", "InvalidParameterException"):
+                    inc("failedLexBots")
+                    add_error("lexBots", {"name": bot_name, "action": "associate", "error": str(e)})
+                    print(f"  WARN: Lex V1 bot not found in target region: {bot_name}", file=sys.stderr)
+                elif not continue_on_error:
+                    raise
+                else:
+                    inc("failedLexBots")
+                    add_error("lexBots", {"name": bot_name, "action": "associate", "error": str(e)})
 
     return {
         **stats,
