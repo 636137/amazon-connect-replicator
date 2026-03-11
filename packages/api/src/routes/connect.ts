@@ -366,18 +366,25 @@ connectRouter.post("/import", async (req, res) => {
       instanceId: z.string().min(1),
       overwrite: z.boolean().optional().default(false),
       dryRun: z.boolean().optional().default(false),
-      bundle: z.any()
+      bundle: z.any(),
+      selectedResources: z.array(z.string()).optional()
     })
     .safeParse(req.body);
 
   if (!body.success) return res.status(400).json({ error: "Missing required fields" });
 
-  const { region, instanceId, overwrite, dryRun } = body.data;
+  const { region, instanceId, overwrite, dryRun, selectedResources } = body.data;
 
   const bundle = body.data.bundle as ExportBundleV1;
-  if (bundle?.version !== 1 || !Array.isArray(bundle.contactFlows) || !Array.isArray(bundle.flowModules)) {
+  if (!bundle?.version || (!Array.isArray(bundle.contactFlows) && !Array.isArray(bundle.flowModules))) {
     return res.status(400).json({ error: "Invalid bundle format" });
   }
+
+  // Helper to check if a resource type is selected for import
+  const isSelected = (key: string) => {
+    if (!selectedResources || selectedResources.length === 0) return true;
+    return selectedResources.includes(key);
+  };
 
   try {
     const c = clientFor(region);
@@ -407,70 +414,73 @@ connectRouter.post("/import", async (req, res) => {
     let updatedQueues = 0;
     let skippedQueues = 0;
 
-    // 0) Upsert hours of operation
-    for (const h of bundle.hoursOfOperations || []) {
-      if (!h?.name) continue;
-      const existing = hoursByName.get(h.name);
+    // 0) Upsert hours of operation (if selected)
+    if (isSelected("hoursOfOperations")) {
+      for (const h of bundle.hoursOfOperations || []) {
+        if (!h?.name) continue;
+        const existing = hoursByName.get(h.name);
 
-      if (existing?.Id) {
-        if (!overwrite) {
-          skippedHours++;
-        } else {
-          if (!dryRun) {
-            await c.send(
-              new UpdateHoursOfOperationCommand(
-                omitNil({
-                  InstanceId: instanceId,
-                  HoursOfOperationId: existing.Id,
-                  Name: h.name,
-                  Description: h.description,
-                  TimeZone: h.timeZone,
-                  Config: h.config
-                }) as any
-              )
-            );
+        if (existing?.Id) {
+          if (!overwrite) {
+            skippedHours++;
+          } else {
+            if (!dryRun) {
+              await c.send(
+                new UpdateHoursOfOperationCommand(
+                  omitNil({
+                    InstanceId: instanceId,
+                    HoursOfOperationId: existing.Id,
+                    Name: h.name,
+                    Description: h.description,
+                    TimeZone: h.timeZone,
+                    Config: h.config
+                  }) as any
+                )
+              );
+            }
+            updatedHours++;
           }
-          updatedHours++;
+          if (h.id && existing.Id) hoursReplacements.push([h.id, existing.Id]);
+          if (h.arn && existing.Arn) hoursReplacements.push([h.arn, existing.Arn]);
+          continue;
         }
-        if (h.id && existing.Id) hoursReplacements.push([h.id, existing.Id]);
-        if (h.arn && existing.Arn) hoursReplacements.push([h.arn, existing.Arn]);
-        continue;
-      }
 
-      if (dryRun) {
+        if (dryRun) {
+          createdHours++;
+          continue;
+        }
+
+        const created = await c.send(
+          new CreateHoursOfOperationCommand(
+            omitNil({
+              InstanceId: instanceId,
+              Name: h.name,
+              Description: h.description,
+              TimeZone: h.timeZone,
+              Config: h.config,
+              Tags: h.tags
+            }) as any
+          )
+        );
         createdHours++;
-        continue;
+
+        const createdId = (created as any).HoursOfOperationId;
+        const createdArn = (created as any).HoursOfOperationArn;
+
+        if (h.id && createdId) hoursReplacements.push([h.id, createdId]);
+        if (h.arn && createdArn) hoursReplacements.push([h.arn, createdArn]);
+
+        hoursByName.set(h.name, { Id: createdId, Arn: createdArn, Name: h.name });
       }
-
-      const created = await c.send(
-        new CreateHoursOfOperationCommand(
-          omitNil({
-            InstanceId: instanceId,
-            Name: h.name,
-            Description: h.description,
-            TimeZone: h.timeZone,
-            Config: h.config,
-            Tags: h.tags
-          }) as any
-        )
-      );
-      createdHours++;
-
-      const createdId = (created as any).HoursOfOperationId;
-      const createdArn = (created as any).HoursOfOperationArn;
-
-      if (h.id && createdId) hoursReplacements.push([h.id, createdId]);
-      if (h.arn && createdArn) hoursReplacements.push([h.arn, createdArn]);
-
-      hoursByName.set(h.name, { Id: createdId, Arn: createdArn, Name: h.name });
     }
 
-    // 0b) Upsert queues
-    for (const q of bundle.queues || []) {
-      if (!q?.name) continue;
-      const existing = queueByName.get(q.name);
+    // 0b) Upsert queues (if selected)
+    if (isSelected("queues")) {
+      for (const q of bundle.queues || []) {
+        if (!q?.name) continue;
+        const existing = queueByName.get(q.name);
 
-      // Resolve hours-of-operation in the target (by name preferred)
+        // Resolve hours-of-operation in the target (by name preferred)
       let targetHoursId: string | undefined = undefined;
       if (q.hoursOfOperationName) {
         targetHoursId = hoursByName.get(q.hoursOfOperationName)?.Id;
@@ -561,6 +571,7 @@ connectRouter.post("/import", async (req, res) => {
       if (q.arn && createdArn) queueReplacements.push([q.arn, createdArn]);
 
       queueByName.set(q.name, { Id: createdId, Arn: createdArn, Name: q.name });
+      }
     }
 
     // Build target lookup tables (modules)
@@ -576,59 +587,61 @@ connectRouter.post("/import", async (req, res) => {
     let updatedModules = 0;
     let skippedModules = 0;
 
-    // 1) Upsert flow modules
-    for (const m of bundle.flowModules) {
-      if (!m.name) continue;
-      const existing = moduleByName.get(m.name);
-      const baseContent =
-        typeof m.content === "string" ? applyReplacements(m.content, [...hoursReplacements, ...queueReplacements]) : "{}";
+    // 1) Upsert flow modules (if selected)
+    if (isSelected("flowModules")) {
+      for (const m of bundle.flowModules || []) {
+        if (!m.name) continue;
+        const existing = moduleByName.get(m.name);
+        const baseContent =
+          typeof m.content === "string" ? applyReplacements(m.content, [...hoursReplacements, ...queueReplacements]) : "{}";
 
-      if (existing?.Id) {
-        if (!overwrite) {
-          skippedModules++;
+        if (existing?.Id) {
+          if (!overwrite) {
+            skippedModules++;
+            continue;
+          }
+          if (!dryRun && typeof baseContent === "string") {
+            await c.send(
+              new UpdateContactFlowModuleContentCommand(
+                omitNil({
+                  InstanceId: instanceId,
+                  ContactFlowModuleId: existing.Id,
+                  Content: baseContent,
+                  Settings: m.settings
+                }) as any
+              )
+            );
+          }
+          updatedModules++;
+          if (m.id && existing.Id) moduleReplacements.push([m.id, existing.Id]);
+          if (m.arn && existing.Arn) moduleReplacements.push([m.arn, existing.Arn]);
           continue;
         }
-        if (!dryRun && typeof baseContent === "string") {
-          await c.send(
-            new UpdateContactFlowModuleContentCommand(
-              omitNil({
-                InstanceId: instanceId,
-                ContactFlowModuleId: existing.Id,
-                Content: baseContent,
-                Settings: m.settings
-              }) as any
-            )
-          );
+
+        if (dryRun) {
+          createdModules++;
+          continue;
         }
-        updatedModules++;
-        if (m.id && existing.Id) moduleReplacements.push([m.id, existing.Id]);
-        if (m.arn && existing.Arn) moduleReplacements.push([m.arn, existing.Arn]);
-        continue;
-      }
 
-      if (dryRun) {
+        const created = await c.send(
+          new CreateContactFlowModuleCommand(
+            omitNil({
+              InstanceId: instanceId,
+              Name: m.name,
+              Description: m.description,
+              Content: baseContent || "{}",
+              Tags: m.tags,
+              Settings: m.settings
+            }) as any
+          )
+        );
         createdModules++;
-        continue;
+
+        if (m.id && created.Id) moduleReplacements.push([m.id, created.Id]);
+        if (m.arn && created.Arn) moduleReplacements.push([m.arn, created.Arn]);
+
+        moduleByName.set(m.name, { Id: created.Id, Arn: created.Arn, Name: m.name });
       }
-
-      const created = await c.send(
-        new CreateContactFlowModuleCommand(
-          omitNil({
-            InstanceId: instanceId,
-            Name: m.name,
-            Description: m.description,
-            Content: baseContent || "{}",
-            Tags: m.tags,
-            Settings: m.settings
-          }) as any
-        )
-      );
-      createdModules++;
-
-      if (m.id && created.Id) moduleReplacements.push([m.id, created.Id]);
-      if (m.arn && created.Arn) moduleReplacements.push([m.arn, created.Arn]);
-
-      moduleByName.set(m.name, { Id: created.Id, Arn: created.Arn, Name: m.name });
     }
 
     // Flow replacements are only known after creating/updating flows.
@@ -642,7 +655,7 @@ connectRouter.post("/import", async (req, res) => {
     }
 
     // Pre-populate flow replacements for flows that already exist in the target instance.
-    for (const f0 of bundle.contactFlows) {
+    for (const f0 of bundle.contactFlows || []) {
       if (!f0?.name || !f0?.type) continue;
       const existing0 = flowByNameType.get(`${f0.type}|${f0.name}`);
       if (!existing0?.Id) continue;
@@ -656,56 +669,57 @@ connectRouter.post("/import", async (req, res) => {
 
     const importedFlowTargets: Array<{ source: ExportedContactFlow; targetId: string }> = [];
 
-    // 2) Upsert flows (first pass: replace modules)
-    for (const f of bundle.contactFlows) {
-      if (!f.name || !f.type) continue;
+    // 2) Upsert flows (first pass: replace modules) - if selected
+    if (isSelected("contactFlows")) {
+      for (const f of bundle.contactFlows || []) {
+        if (!f.name || !f.type) continue;
 
-      const key = `${f.type}|${f.name}`;
-      const existing = flowByNameType.get(key);
-      const content1 =
-        typeof f.content === "string"
-          ? applyReplacements(
-              applyReplacements(
-                applyReplacements(f.content, [...hoursReplacements, ...queueReplacements]),
-                moduleReplacements
-              ),
-              flowReplacements
-            )
-          : "{}";
+        const key = `${f.type}|${f.name}`;
+        const existing = flowByNameType.get(key);
+        const content1 =
+          typeof f.content === "string"
+            ? applyReplacements(
+                applyReplacements(
+                  applyReplacements(f.content, [...hoursReplacements, ...queueReplacements]),
+                  moduleReplacements
+                ),
+                flowReplacements
+              )
+            : "{}";
 
-      if (existing?.Id) {
-        if (!overwrite) {
-          skippedFlows++;
+        if (existing?.Id) {
+          if (!overwrite) {
+            skippedFlows++;
+            continue;
+          }
+          if (!dryRun) {
+            await c.send(
+              new UpdateContactFlowContentCommand({
+                InstanceId: instanceId,
+                ContactFlowId: existing.Id,
+                Content: content1
+              })
+            );
+          }
+          updatedFlows++;
+
+          if (f.id) flowReplacements.push([f.id, existing.Id]);
+          if (f.arn && existing.Arn) flowReplacements.push([f.arn, existing.Arn]);
+
+          importedFlowTargets.push({ source: f, targetId: existing.Id });
           continue;
         }
-        if (!dryRun) {
-          await c.send(
-            new UpdateContactFlowContentCommand({
-              InstanceId: instanceId,
-              ContactFlowId: existing.Id,
-              Content: content1
-            })
-          );
+
+        if (dryRun) {
+          createdFlows++;
+          continue;
         }
-        updatedFlows++;
 
-        if (f.id) flowReplacements.push([f.id, existing.Id]);
-        if (f.arn && existing.Arn) flowReplacements.push([f.arn, existing.Arn]);
-
-        importedFlowTargets.push({ source: f, targetId: existing.Id });
-        continue;
-      }
-
-      if (dryRun) {
-        createdFlows++;
-        continue;
-      }
-
-      const created = await c.send(
-        new CreateContactFlowCommand(
-          omitNil({
-            InstanceId: instanceId,
-            Name: f.name,
+        const created = await c.send(
+          new CreateContactFlowCommand(
+            omitNil({
+              InstanceId: instanceId,
+              Name: f.name,
             Type: f.type as any,
             Description: f.description,
             Content: content1,
@@ -722,16 +736,17 @@ connectRouter.post("/import", async (req, res) => {
         importedFlowTargets.push({ source: f, targetId: created.ContactFlowId });
       }
 
-      flowByNameType.set(key, {
-        Id: created.ContactFlowId,
-        Arn: created.ContactFlowArn,
-        Name: f.name,
-        ContactFlowType: f.type
-      });
+        flowByNameType.set(key, {
+          Id: created.ContactFlowId,
+          Arn: created.ContactFlowArn,
+          Name: f.name,
+          ContactFlowType: f.type
+        });
+      }
     }
 
     // 3) Second pass: update imported flows to replace flow-to-flow references too
-    if (!dryRun && overwrite) {
+    if (isSelected("contactFlows") && !dryRun && overwrite) {
       for (const { source, targetId } of importedFlowTargets) {
         if (!overwrite && createdFlows === 0 && updatedFlows === 0) break;
         if (typeof source.content !== "string") continue;

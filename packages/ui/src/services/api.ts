@@ -1,4 +1,4 @@
-import type { ConnectRegion, DescribeInstance, ExportBundleV1, InstanceSummary } from "../types/connect";
+import type { ConnectRegion, DescribeInstance, ExportBundleV1, InstanceSummary, ResourceType } from "../types/connect";
 
 async function json<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, {
@@ -51,6 +51,7 @@ export async function importBundle(params: {
   instanceId: string;
   bundle: ExportBundleV1;
   overwrite?: boolean;
+  selectedResources?: ResourceType[];
 }): Promise<any> {
   return json("/api/connect/import", {
     method: "POST",

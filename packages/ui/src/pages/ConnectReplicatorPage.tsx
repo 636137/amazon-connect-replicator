@@ -1,17 +1,24 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowRight,
+  Check,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   CloudDownload,
   FileJson2,
+  Layers,
   Loader2,
   RadioTower,
   RefreshCw,
   ShieldAlert,
+  Square,
+  SquareCheck,
   Upload
 } from "lucide-react";
 
-import type { ConnectRegion, DescribeInstance, ExportBundleV1, InstanceSummary } from "../types/connect";
+import type { ConnectRegion, DescribeInstance, ExportBundleV1, InstanceSummary, ResourceType } from "../types/connect";
+import { RESOURCE_TYPES } from "../types/connect";
 import {
   describeInstance,
   exportBundle,
@@ -45,6 +52,160 @@ async function readJsonFile(file: File): Promise<any> {
   return JSON.parse(text);
 }
 
+function ResourceSelector({
+  bundle,
+  selectedResources,
+  setSelectedResources,
+}: {
+  bundle: ExportBundleV1 | null;
+  selectedResources: Set<ResourceType>;
+  setSelectedResources: (s: Set<ResourceType>) => void;
+}) {
+  const [expanded, setExpanded] = useState(true);
+
+  const getCount = (key: ResourceType): number => {
+    if (!bundle) return 0;
+    const arr = bundle[key];
+    return Array.isArray(arr) ? arr.length : 0;
+  };
+
+  const availableResources = RESOURCE_TYPES.filter(r => getCount(r.key) > 0);
+  const unavailableResources = RESOURCE_TYPES.filter(r => getCount(r.key) === 0);
+
+  const allSelected = availableResources.every(r => selectedResources.has(r.key));
+  const noneSelected = availableResources.every(r => !selectedResources.has(r.key));
+
+  const toggleResource = (key: ResourceType) => {
+    const next = new Set(selectedResources);
+    if (next.has(key)) {
+      next.delete(key);
+    } else {
+      next.add(key);
+    }
+    setSelectedResources(next);
+  };
+
+  const selectAll = () => {
+    setSelectedResources(new Set(availableResources.map(r => r.key)));
+  };
+
+  const selectNone = () => {
+    setSelectedResources(new Set());
+  };
+
+  if (!bundle) {
+    return (
+      <div className="rounded-xl bg-black/20 p-4 text-sm text-white/50 ring-1 ring-white/10">
+        <div className="flex items-center gap-2">
+          <Layers className="h-4 w-4" />
+          Load a bundle to select resources
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-xl bg-black/20 ring-1 ring-white/10 overflow-hidden">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="w-full flex items-center justify-between px-4 py-3 text-sm font-medium hover:bg-white/5 transition"
+      >
+        <div className="flex items-center gap-2">
+          <Layers className="h-4 w-4 text-cyan-300" />
+          <span>Resources to Replicate</span>
+          <span className="ml-2 rounded-full bg-cyan-500/20 px-2 py-0.5 text-xs text-cyan-200">
+            {selectedResources.size} of {availableResources.length} selected
+          </span>
+        </div>
+        {expanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+      </button>
+
+      {expanded && (
+        <div className="border-t border-white/10 p-4">
+          {/* Quick actions */}
+          <div className="flex items-center gap-3 mb-4">
+            <button
+              onClick={selectAll}
+              disabled={allSelected}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500/15 px-3 py-1.5 text-xs text-emerald-200 ring-1 ring-emerald-500/30 transition hover:bg-emerald-500/25 disabled:opacity-40"
+            >
+              <SquareCheck className="h-3.5 w-3.5" />
+              Select All
+            </button>
+            <button
+              onClick={selectNone}
+              disabled={noneSelected}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-white/10 px-3 py-1.5 text-xs ring-1 ring-white/10 transition hover:bg-white/15 disabled:opacity-40"
+            >
+              <Square className="h-3.5 w-3.5" />
+              Select None
+            </button>
+          </div>
+
+          {/* Available resources grid */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+            {availableResources.map((r) => {
+              const count = getCount(r.key);
+              const isSelected = selectedResources.has(r.key);
+              return (
+                <button
+                  key={r.key}
+                  onClick={() => toggleResource(r.key)}
+                  className={`group relative flex items-start gap-3 rounded-xl p-3 text-left transition ring-1 ${
+                    isSelected
+                      ? "bg-cyan-500/15 ring-cyan-500/40 text-cyan-50"
+                      : "bg-white/5 ring-white/10 hover:bg-white/10 text-white/80"
+                  }`}
+                >
+                  <div className={`mt-0.5 flex-shrink-0 rounded-md p-1 ${
+                    isSelected ? "bg-cyan-500/30" : "bg-white/10"
+                  }`}>
+                    {isSelected ? (
+                      <Check className="h-3.5 w-3.5 text-cyan-200" />
+                    ) : (
+                      <Square className="h-3.5 w-3.5 text-white/50" />
+                    )}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-medium truncate">{r.label}</span>
+                      <span className={`rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${
+                        isSelected ? "bg-cyan-500/30 text-cyan-100" : "bg-white/10 text-white/60"
+                      }`}>
+                        {count}
+                      </span>
+                    </div>
+                    <div className="text-xs text-white/50 mt-0.5 truncate">{r.description}</div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Unavailable resources (collapsed) */}
+          {unavailableResources.length > 0 && (
+            <div className="mt-4 pt-4 border-t border-white/10">
+              <div className="text-xs text-white/40 mb-2">
+                Not in bundle ({unavailableResources.length}):
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {unavailableResources.map(r => (
+                  <span
+                    key={r.key}
+                    className="inline-flex items-center rounded-full bg-white/5 px-2 py-0.5 text-[10px] text-white/40 ring-1 ring-white/10"
+                  >
+                    {r.label}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function ConnectReplicatorPage() {
   const [regions, setRegions] = useState<ConnectRegion[]>([]);
 
@@ -60,7 +221,8 @@ export default function ConnectReplicatorPage() {
 
   const [bundle, setBundle] = useState<ExportBundleV1 | null>(null);
   const [bundleName, setBundleName] = useState<string>("");
-  const [overwrite, setOverwrite] = useState<boolean>(false);
+  const [overwrite, setOverwrite] = useState<boolean>(true);
+  const [selectedResources, setSelectedResources] = useState<Set<ResourceType>>(new Set());
 
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -73,8 +235,21 @@ export default function ConnectReplicatorPage() {
 
   const exportFilename = useMemo(() => {
     const safe = (source?.InstanceAlias || sourceId || "connect-instance").replace(/[^a-zA-Z0-9-_]+/g, "-");
-    return `${safe}-${sourceRegion}.connect-export.v1.json`;
+    return `${safe}-${sourceRegion}.connect-export.v3.json`;
   }, [source?.InstanceAlias, sourceId, sourceRegion]);
+
+  // Auto-select all available resources when bundle changes
+  useEffect(() => {
+    if (bundle) {
+      const available = RESOURCE_TYPES.filter(r => {
+        const arr = bundle[r.key];
+        return Array.isArray(arr) && arr.length > 0;
+      }).map(r => r.key);
+      setSelectedResources(new Set(available));
+    } else {
+      setSelectedResources(new Set());
+    }
+  }, [bundle]);
 
   async function refreshSourceInstances() {
     setError(null);
@@ -165,13 +340,19 @@ export default function ConnectReplicatorPage() {
   async function doExport() {
     if (!sourceId) return;
     setError(null);
-    setBusy("Exporting contact flows + modules...");
+    setBusy("Exporting configuration bundle...");
     try {
       const b = await exportBundle(sourceRegion, sourceId);
       setBundle(b);
       setBundleName(exportFilename);
       downloadJson(exportFilename, b);
-      setLog((l) => [`Exported bundle: modules=${b.flowModules.length}, flows=${b.contactFlows.length}`, ...l]);
+      
+      const counts = RESOURCE_TYPES
+        .map(r => ({ key: r.key, count: Array.isArray(b[r.key]) ? b[r.key]!.length : 0 }))
+        .filter(x => x.count > 0)
+        .map(x => `${x.key}=${x.count}`)
+        .join(", ");
+      setLog((l) => [`Exported bundle (v${b.version}): ${counts}`, ...l]);
     } catch (e: any) {
       setError(e?.message || String(e));
     } finally {
@@ -185,17 +366,33 @@ export default function ConnectReplicatorPage() {
       setError("No bundle loaded. Export one or choose a JSON bundle file.");
       return;
     }
+    if (selectedResources.size === 0) {
+      setError("No resources selected. Select at least one resource type to import.");
+      return;
+    }
 
     setError(null);
-    setBusy("Importing bundle into target instance...");
+    const resourceList = Array.from(selectedResources);
+    setBusy(`Importing ${resourceList.length} resource types...`);
     try {
       const out = await importBundle({
         region: targetRegion,
         instanceId: targetId,
         bundle,
-        overwrite
+        overwrite,
+        selectedResources: resourceList
       });
-      setLog((l) => [`Import finished: ${JSON.stringify(out)}`, ...l]);
+      
+      const summary = Object.entries(out)
+        .filter(([k, v]) => typeof v === "number" && v > 0 && !k.startsWith("failed"))
+        .map(([k, v]) => `${k}=${v}`)
+        .join(", ");
+      setLog((l) => [`Import finished (${resourceList.length} types): ${summary || "no changes"}`, ...l]);
+      
+      // Log any errors
+      if (out.errors && Object.keys(out.errors).length > 0) {
+        setLog((l) => [`⚠️ Import had errors: ${JSON.stringify(out.errors)}`, ...l]);
+      }
     } catch (e: any) {
       setError(e?.message || String(e));
     } finally {
@@ -219,17 +416,16 @@ export default function ConnectReplicatorPage() {
 
   return (
     <div className="relative min-h-screen noise">
-      <div className="mx-auto max-w-6xl px-6 py-10">
+      <div className="mx-auto max-w-7xl px-6 py-10">
         <header className="flex flex-col gap-6 md:flex-row md:items-end md:justify-between">
           <div>
             <div className="inline-flex items-center gap-2 rounded-full bg-white/10 px-3 py-1 text-xs text-white/80 ring-1 ring-white/10">
               <RadioTower className="h-4 w-4" />
-              Primitive Connect APIs • Export/Import
+              Primitive Connect APIs • v3 Bundle (17 Resource Types)
             </div>
             <h1 className="mt-4 text-3xl font-bold tracking-tight">Amazon Connect Replicator</h1>
             <p className="mt-2 max-w-2xl text-sm text-white/70">
-              Best-effort migration using Connect List/Describe/Create/Update APIs. This does not create a new instance;
-              it copies resources between existing instances.
+              Best-effort migration using Connect List/Describe/Create/Update APIs. Select which resources to sync from source to target.
             </p>
           </div>
 
@@ -248,10 +444,11 @@ export default function ConnectReplicatorPage() {
         </header>
 
         <div className="mt-8 grid grid-cols-1 gap-6 lg:grid-cols-12">
+          {/* Source Panel */}
           <section className="lg:col-span-5">
             <div className="rounded-2xl bg-white/5 p-5 ring-1 ring-white/10">
               <div className="flex items-center justify-between">
-                <h2 className="text-lg font-semibold">Source</h2>
+                <h2 className="text-lg font-semibold">Source Instance</h2>
                 <div className={`rounded-full px-3 py-1 text-xs ${pillTone(source?.InstanceStatus)}`}>
                   {source?.InstanceStatus || "—"}
                 </div>
@@ -295,7 +492,7 @@ export default function ConnectReplicatorPage() {
                   className="inline-flex items-center gap-2 rounded-xl bg-emerald-500/15 px-4 py-2 text-sm text-emerald-100 ring-1 ring-emerald-500/30 transition hover:bg-emerald-500/20 disabled:opacity-40"
                 >
                   <CloudDownload className="h-4 w-4" />
-                  Export bundle
+                  Export Bundle
                 </button>
 
                 <button
@@ -312,15 +509,6 @@ export default function ConnectReplicatorPage() {
                 </button>
               </div>
 
-              <div className="mt-4 rounded-xl bg-black/20 p-4 text-xs text-white/70 ring-1 ring-white/10">
-                <div className="font-semibold text-white/80">What’s included (v1)</div>
-                <div className="mt-2">• Contact Flow Modules (describe + content)</div>
-                <div>• Contact Flows (describe + content)</div>
-                <div className="mt-3 text-white/60">
-                  Notes: prompts/queues/routing profiles/etc are not copied yet. Flow JSON may reference resources by ID/ARN.
-                </div>
-              </div>
-
               {!sourceOk && source && (
                 <div className="mt-4 rounded-xl bg-amber-500/10 p-4 text-sm text-amber-100 ring-1 ring-amber-500/20">
                   <div className="flex items-start gap-3">
@@ -334,10 +522,11 @@ export default function ConnectReplicatorPage() {
             </div>
           </section>
 
+          {/* Target Panel */}
           <section className="lg:col-span-7">
             <div className="rounded-2xl bg-white/5 p-5 ring-1 ring-white/10">
               <div className="flex items-center justify-between">
-                <h2 className="text-lg font-semibold">Target</h2>
+                <h2 className="text-lg font-semibold">Target Instance</h2>
                 <div className={`rounded-full px-3 py-1 text-xs ${pillTone(target?.InstanceStatus)}`}>
                   {target?.InstanceStatus || "—"}
                 </div>
@@ -376,6 +565,7 @@ export default function ConnectReplicatorPage() {
                 </div>
               </div>
 
+              {/* Bundle load section */}
               <div className="mt-4 rounded-xl bg-black/20 p-4 ring-1 ring-white/10">
                 <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
                   <div className="text-sm">
@@ -383,7 +573,10 @@ export default function ConnectReplicatorPage() {
                     <div className="mt-1 text-xs text-white/60">
                       {bundle ? (
                         <span>
-                          Loaded <span className="font-medium text-white/80">{bundleName || "bundle"}</span> • modules={bundle.flowModules.length} • flows={bundle.contactFlows.length}
+                          Loaded <span className="font-medium text-white/80">{bundleName || "bundle"}</span>
+                          <span className="ml-2 rounded-full bg-emerald-500/20 px-2 py-0.5 text-emerald-200">
+                            v{bundle.version}
+                          </span>
                         </span>
                       ) : (
                         <span>No bundle loaded yet.</span>
@@ -404,10 +597,10 @@ export default function ConnectReplicatorPage() {
                         setBusy("Loading bundle file...");
                         try {
                           const parsed = (await readJsonFile(f)) as ExportBundleV1;
-                          if (parsed?.version !== 1) throw new Error("Unsupported bundle version");
+                          if (![1, 2, 3].includes(parsed?.version)) throw new Error("Unsupported bundle version");
                           setBundle(parsed);
                           setBundleName(f.name);
-                          setLog((l) => [`Loaded bundle file: ${f.name}`, ...l]);
+                          setLog((l) => [`Loaded bundle file: ${f.name} (v${parsed.version})`, ...l]);
                         } catch (err: any) {
                           setError(err?.message || String(err));
                         } finally {
@@ -425,19 +618,22 @@ export default function ConnectReplicatorPage() {
                       <Upload className="h-4 w-4" />
                       Choose file
                     </button>
-
-                    <button
-                      onClick={doImport}
-                      disabled={!targetId || !!busy || !bundle}
-                      className="inline-flex items-center gap-2 rounded-xl bg-cyan-500/15 px-4 py-2 text-sm text-cyan-100 ring-1 ring-cyan-500/30 transition hover:bg-cyan-500/20 disabled:opacity-40"
-                    >
-                      <ArrowRight className="h-4 w-4" />
-                      Import
-                    </button>
                   </div>
                 </div>
+              </div>
 
-                <div className="mt-3 flex items-center gap-3 text-xs text-white/70">
+              {/* Resource selector */}
+              <div className="mt-4">
+                <ResourceSelector
+                  bundle={bundle}
+                  selectedResources={selectedResources}
+                  setSelectedResources={setSelectedResources}
+                />
+              </div>
+
+              {/* Import controls */}
+              <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex items-center gap-4 text-xs text-white/70">
                   <label className="inline-flex select-none items-center gap-2">
                     <input
                       type="checkbox"
@@ -445,10 +641,10 @@ export default function ConnectReplicatorPage() {
                       onChange={(e) => setOverwrite(e.target.checked)}
                       className="h-4 w-4 rounded border-white/20 bg-black/30"
                     />
-                    Overwrite existing flows/modules (by name)
+                    Overwrite existing (update if exists)
                   </label>
 
-                  <div className="ml-auto inline-flex items-center gap-2">
+                  <div className="inline-flex items-center gap-2">
                     {targetOk ? (
                       <>
                         <CheckCircle2 className="h-4 w-4 text-emerald-300" />
@@ -463,9 +659,14 @@ export default function ConnectReplicatorPage() {
                   </div>
                 </div>
 
-                <div className="mt-3 text-xs text-white/60">
-                  Import is best-effort: flow JSON may still reference prompts/queues/routing profiles not present in the target.
-                </div>
+                <button
+                  onClick={doImport}
+                  disabled={!targetId || !!busy || !bundle || selectedResources.size === 0}
+                  className="inline-flex items-center justify-center gap-2 rounded-xl bg-cyan-500/20 px-6 py-2.5 text-sm font-medium text-cyan-100 ring-1 ring-cyan-500/40 transition hover:bg-cyan-500/30 disabled:opacity-40"
+                >
+                  <ArrowRight className="h-4 w-4" />
+                  Import {selectedResources.size > 0 ? `(${selectedResources.size} types)` : ""}
+                </button>
               </div>
 
               {busy && (
@@ -482,8 +683,8 @@ export default function ConnectReplicatorPage() {
               )}
 
               <div className="mt-6">
-                <div className="text-xs font-semibold text-white/70">Activity</div>
-                <div className="mt-2 max-h-[240px] overflow-auto rounded-xl bg-black/30 p-3 text-xs text-white/70 ring-1 ring-white/10">
+                <div className="text-xs font-semibold text-white/70">Activity Log</div>
+                <div className="mt-2 max-h-[200px] overflow-auto rounded-xl bg-black/30 p-3 text-xs text-white/70 ring-1 ring-white/10 font-mono">
                   {log.length === 0 ? (
                     <div className="text-white/50">No activity yet.</div>
                   ) : (
