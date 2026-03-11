@@ -107,11 +107,16 @@ type ExportBundleV1 = {
 
 function applyReplacements(content: string, replacements: Array<[string, string]>): string {
   let out = content;
-  for (const [from, to] of replacements) {
+  const sorted = [...replacements].sort((a, b) => (b?.[0]?.length || 0) - (a?.[0]?.length || 0));
+  for (const [from, to] of sorted) {
     if (!from || from === to) continue;
     out = out.split(from).join(to);
   }
   return out;
+}
+
+function omitNil<T extends Record<string, any>>(obj: T): Partial<T> {
+  return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined && v !== null)) as Partial<T>;
 }
 
 async function listAllContactFlowModules(region: string, instanceId: string) {
@@ -413,14 +418,16 @@ connectRouter.post("/import", async (req, res) => {
         } else {
           if (!dryRun) {
             await c.send(
-              new UpdateHoursOfOperationCommand({
-                InstanceId: instanceId,
-                HoursOfOperationId: existing.Id,
-                Name: h.name,
-                Description: h.description,
-                TimeZone: h.timeZone,
-                Config: h.config
-              } as any)
+              new UpdateHoursOfOperationCommand(
+                omitNil({
+                  InstanceId: instanceId,
+                  HoursOfOperationId: existing.Id,
+                  Name: h.name,
+                  Description: h.description,
+                  TimeZone: h.timeZone,
+                  Config: h.config
+                }) as any
+              )
             );
           }
           updatedHours++;
@@ -436,14 +443,16 @@ connectRouter.post("/import", async (req, res) => {
       }
 
       const created = await c.send(
-        new CreateHoursOfOperationCommand({
-          InstanceId: instanceId,
-          Name: h.name,
-          Description: h.description,
-          TimeZone: h.timeZone,
-          Config: h.config,
-          Tags: h.tags
-        } as any)
+        new CreateHoursOfOperationCommand(
+          omitNil({
+            InstanceId: instanceId,
+            Name: h.name,
+            Description: h.description,
+            TimeZone: h.timeZone,
+            Config: h.config,
+            Tags: h.tags
+          }) as any
+        )
       );
       createdHours++;
 
@@ -531,15 +540,17 @@ connectRouter.post("/import", async (req, res) => {
       }
 
       const created = await c.send(
-        new CreateQueueCommand({
-          InstanceId: instanceId,
-          Name: q.name,
-          Description: q.description,
-          HoursOfOperationId: targetHoursId,
-          MaxContacts: q.maxContacts,
-          OutboundCallerConfig: q.outboundCallerConfig,
-          Tags: q.tags
-        } as any)
+        new CreateQueueCommand(
+          omitNil({
+            InstanceId: instanceId,
+            Name: q.name,
+            Description: q.description,
+            HoursOfOperationId: targetHoursId,
+            MaxContacts: q.maxContacts,
+            OutboundCallerConfig: q.outboundCallerConfig || undefined,
+            Tags: q.tags
+          }) as any
+        )
       );
       createdQueues++;
 
@@ -579,12 +590,14 @@ connectRouter.post("/import", async (req, res) => {
         }
         if (!dryRun && typeof baseContent === "string") {
           await c.send(
-            new UpdateContactFlowModuleContentCommand({
-              InstanceId: instanceId,
-              ContactFlowModuleId: existing.Id,
-              Content: baseContent,
-              Settings: m.settings
-            })
+            new UpdateContactFlowModuleContentCommand(
+              omitNil({
+                InstanceId: instanceId,
+                ContactFlowModuleId: existing.Id,
+                Content: baseContent,
+                Settings: m.settings
+              }) as any
+            )
           );
         }
         updatedModules++;
@@ -599,14 +612,16 @@ connectRouter.post("/import", async (req, res) => {
       }
 
       const created = await c.send(
-        new CreateContactFlowModuleCommand({
-          InstanceId: instanceId,
-          Name: m.name,
-          Description: m.description,
-          Content: baseContent || "{}",
-          Tags: m.tags,
-          Settings: m.settings
-        })
+        new CreateContactFlowModuleCommand(
+          omitNil({
+            InstanceId: instanceId,
+            Name: m.name,
+            Description: m.description,
+            Content: baseContent || "{}",
+            Tags: m.tags,
+            Settings: m.settings
+          }) as any
+        )
       );
       createdModules++;
 
@@ -626,6 +641,15 @@ connectRouter.post("/import", async (req, res) => {
       if (f.Name && f.ContactFlowType) flowByNameType.set(`${f.ContactFlowType}|${f.Name}`, f);
     }
 
+    // Pre-populate flow replacements for flows that already exist in the target instance.
+    for (const f0 of bundle.contactFlows) {
+      if (!f0?.name || !f0?.type) continue;
+      const existing0 = flowByNameType.get(`${f0.type}|${f0.name}`);
+      if (!existing0?.Id) continue;
+      if (f0.id) flowReplacements.push([f0.id, existing0.Id]);
+      if (f0.arn && existing0.Arn) flowReplacements.push([f0.arn, existing0.Arn]);
+    }
+
     let createdFlows = 0;
     let updatedFlows = 0;
     let skippedFlows = 0;
@@ -641,8 +665,11 @@ connectRouter.post("/import", async (req, res) => {
       const content1 =
         typeof f.content === "string"
           ? applyReplacements(
-              applyReplacements(f.content, [...hoursReplacements, ...queueReplacements]),
-              moduleReplacements
+              applyReplacements(
+                applyReplacements(f.content, [...hoursReplacements, ...queueReplacements]),
+                moduleReplacements
+              ),
+              flowReplacements
             )
           : "{}";
 
@@ -675,14 +702,16 @@ connectRouter.post("/import", async (req, res) => {
       }
 
       const created = await c.send(
-        new CreateContactFlowCommand({
-          InstanceId: instanceId,
-          Name: f.name,
-          Type: f.type as any,
-          Description: f.description,
-          Content: content1,
-          Tags: f.tags
-        })
+        new CreateContactFlowCommand(
+          omitNil({
+            InstanceId: instanceId,
+            Name: f.name,
+            Type: f.type as any,
+            Description: f.description,
+            Content: content1,
+            Tags: f.tags
+          }) as any
+        )
       );
       createdFlows++;
 

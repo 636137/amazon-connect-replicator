@@ -6,7 +6,7 @@ import sys
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ParamValidationError
 
 
 CONTACT_FLOW_TYPES: List[str] = [
@@ -21,6 +21,22 @@ CONTACT_FLOW_TYPES: List[str] = [
     "QUEUE_TRANSFER",
     "CAMPAIGN",
 ]
+
+
+def _unsupported_reasons(content: str) -> List[str]:
+    l = content.lower()
+    reasons: List[str] = []
+    if "/prompt/" in l:
+        reasons.append("prompt")
+    if "arn:aws:lex:" in l:
+        reasons.append("lex")
+    if "arn:aws:lambda:" in l:
+        reasons.append("lambda")
+    if "arn:aws:s3:::" in l:
+        reasons.append("s3")
+    if "/phone-number/" in l:
+        reasons.append("phone-number")
+    return reasons
 
 
 def _session(profile: Optional[str], region: str) -> boto3.session.Session:
@@ -48,11 +64,15 @@ def _paginate(method, *, next_token_key: str = "NextToken", **kwargs) -> Iterabl
 
 def _apply_replacements(content: str, replacements: List[Tuple[str, str]]) -> str:
     out = content
-    for src, dst in replacements:
+    for src, dst in sorted(replacements, key=lambda t: len(t[0] or ""), reverse=True):
         if not src or src == dst:
             continue
         out = out.replace(src, dst)
     return out
+
+
+def _drop_none(d: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in d.items() if v is not None}
 
 
 def export_bundle(*, profile: Optional[str], region: str, instance_id: str) -> Dict[str, Any]:
@@ -107,8 +127,8 @@ def export_bundle(*, profile: Optional[str], region: str, instance_id: str) -> D
             continue
         try:
             d = client.describe_queue(InstanceId=instance_id, QueueId=qid)
-        except ClientError as e:
-            code = (e.response or {}).get("Error", {}).get("Code")
+        except (ClientError, ParamValidationError) as e:
+            code = (getattr(e, "response", None) or {}).get("Error", {}).get("Code")
             if code == "ResourceNotFoundException":
                 print(f"WARN: skipping queue id {qid}: {code}", file=sys.stderr)
                 continue
@@ -209,6 +229,8 @@ def import_bundle(
     bundle: Dict[str, Any],
     overwrite: bool,
     dry_run: bool,
+    continue_on_error: bool = False,
+    skip_unsupported: bool = False,
 ) -> Dict[str, Any]:
     if bundle.get("version") != 1:
         raise ValueError("Unsupported bundle version")
@@ -223,7 +245,8 @@ def import_bundle(
                 existing_hours[h["Name"]] = h
 
     hours_repl: List[Tuple[str, str]] = []
-    created_hours = updated_hours = skipped_hours = 0
+    created_hours = updated_hours = skipped_hours = failed_hours = 0
+    hours_errors: List[Dict[str, Any]] = []
 
     for h in bundle.get("hoursOfOperations") or []:
         name = h.get("name")
@@ -235,16 +258,34 @@ def import_bundle(
             if not overwrite:
                 skipped_hours += 1
             else:
-                if not dry_run:
-                    client.update_hours_of_operation(
-                        InstanceId=instance_id,
-                        HoursOfOperationId=existing["Id"],
-                        Name=name,
-                        Description=h.get("description"),
-                        TimeZone=h.get("timeZone"),
-                        Config=h.get("config"),
-                    )
-                updated_hours += 1
+                if dry_run:
+                    updated_hours += 1
+                else:
+                    try:
+                        client.update_hours_of_operation(
+                            **_drop_none(
+                                {
+                                    "InstanceId": instance_id,
+                                    "HoursOfOperationId": existing["Id"],
+                                    "Name": name,
+                                    "Description": h.get("description"),
+                                    "TimeZone": h.get("timeZone"),
+                                    "Config": h.get("config"),
+                                }
+                            )
+                        )
+                        updated_hours += 1
+                    except (ClientError, ParamValidationError) as e:
+                        if not continue_on_error:
+                            raise
+                        failed_hours += 1
+                        hours_errors.append(
+                            {
+                                "name": name,
+                                "action": "update",
+                                "error": str(e),
+                            }
+                        )
 
             if h.get("id"):
                 hours_repl.append((h["id"], existing["Id"]))
@@ -256,15 +297,32 @@ def import_bundle(
             created_hours += 1
             continue
 
-        resp = client.create_hours_of_operation(
-            InstanceId=instance_id,
-            Name=name,
-            Description=h.get("description"),
-            TimeZone=h.get("timeZone"),
-            Config=h.get("config"),
-            Tags=h.get("tags"),
-        )
-        created_hours += 1
+        try:
+            resp = client.create_hours_of_operation(
+                **_drop_none(
+                    {
+                        "InstanceId": instance_id,
+                        "Name": name,
+                        "Description": h.get("description"),
+                        "TimeZone": h.get("timeZone"),
+                        "Config": h.get("config"),
+                        "Tags": h.get("tags"),
+                    }
+                )
+            )
+            created_hours += 1
+        except (ClientError, ParamValidationError) as e:
+            if not continue_on_error:
+                raise
+            failed_hours += 1
+            hours_errors.append(
+                {
+                    "name": name,
+                    "action": "create",
+                    "error": str(e),
+                }
+            )
+            continue
 
         existing_hours[name] = {
             "Id": resp.get("HoursOfOperationId"),
@@ -295,7 +353,8 @@ def import_bundle(
                 existing_queues[q["Name"]] = q
 
     queue_repl: List[Tuple[str, str]] = []
-    created_queues = updated_queues = skipped_queues = 0
+    created_queues = updated_queues = skipped_queues = failed_queues = 0
+    queue_errors: List[Dict[str, Any]] = []
 
     for q in bundle.get("queues") or []:
         name = q.get("name")
@@ -308,32 +367,46 @@ def import_bundle(
             if not overwrite:
                 skipped_queues += 1
             else:
-                if not dry_run:
-                    if isinstance(q.get("maxContacts"), int):
-                        client.update_queue_max_contacts(
-                            InstanceId=instance_id,
-                            QueueId=existing["Id"],
-                            MaxContacts=q.get("maxContacts"),
+                if dry_run:
+                    updated_queues += 1
+                else:
+                    try:
+                        if isinstance(q.get("maxContacts"), int):
+                            client.update_queue_max_contacts(
+                                InstanceId=instance_id,
+                                QueueId=existing["Id"],
+                                MaxContacts=q.get("maxContacts"),
+                            )
+                        if target_hours_id:
+                            client.update_queue_hours_of_operation(
+                                InstanceId=instance_id,
+                                QueueId=existing["Id"],
+                                HoursOfOperationId=target_hours_id,
+                            )
+                        if q.get("outboundCallerConfig"):
+                            client.update_queue_outbound_caller_config(
+                                InstanceId=instance_id,
+                                QueueId=existing["Id"],
+                                OutboundCallerConfig=q.get("outboundCallerConfig"),
+                            )
+                        if q.get("status"):
+                            client.update_queue_status(
+                                InstanceId=instance_id,
+                                QueueId=existing["Id"],
+                                Status=q.get("status"),
+                            )
+                        updated_queues += 1
+                    except (ClientError, ParamValidationError) as e:
+                        if not continue_on_error:
+                            raise
+                        failed_queues += 1
+                        queue_errors.append(
+                            {
+                                "name": name,
+                                "action": "update",
+                                "error": str(e),
+                            }
                         )
-                    if target_hours_id:
-                        client.update_queue_hours_of_operation(
-                            InstanceId=instance_id,
-                            QueueId=existing["Id"],
-                            HoursOfOperationId=target_hours_id,
-                        )
-                    if q.get("outboundCallerConfig"):
-                        client.update_queue_outbound_caller_config(
-                            InstanceId=instance_id,
-                            QueueId=existing["Id"],
-                            OutboundCallerConfig=q.get("outboundCallerConfig"),
-                        )
-                    if q.get("status"):
-                        client.update_queue_status(
-                            InstanceId=instance_id,
-                            QueueId=existing["Id"],
-                            Status=q.get("status"),
-                        )
-                updated_queues += 1
 
             if q.get("id"):
                 queue_repl.append((q["id"], existing["Id"]))
@@ -346,24 +419,59 @@ def import_bundle(
             continue
 
         if not target_hours_id:
-            raise RuntimeError(f"Queue '{name}' is missing a resolvable hoursOfOperationId/name")
+            msg = f"Queue '{name}' is missing a resolvable hoursOfOperationId/name"
+            if continue_on_error:
+                failed_queues += 1
+                queue_errors.append(
+                    {
+                        "name": name,
+                        "action": "create",
+                        "error": msg,
+                    }
+                )
+                continue
+            raise RuntimeError(msg)
 
-        resp = client.create_queue(
-            InstanceId=instance_id,
-            Name=name,
-            Description=q.get("description"),
-            HoursOfOperationId=target_hours_id,
-            MaxContacts=q.get("maxContacts"),
-            OutboundCallerConfig=q.get("outboundCallerConfig"),
-            Tags=q.get("tags"),
-        )
-        created_queues += 1
+        try:
+            resp = client.create_queue(
+                **_drop_none(
+                    {
+                        "InstanceId": instance_id,
+                        "Name": name,
+                        "Description": q.get("description"),
+                        "HoursOfOperationId": target_hours_id,
+                        "MaxContacts": q.get("maxContacts"),
+                        "OutboundCallerConfig": q.get("outboundCallerConfig") or None,
+                        "Tags": q.get("tags"),
+                    }
+                )
+            )
+            created_queues += 1
+        except (ClientError, ParamValidationError) as e:
+            if not continue_on_error:
+                raise
+            failed_queues += 1
+            queue_errors.append(
+                {
+                    "name": name,
+                    "action": "create",
+                    "error": str(e),
+                }
+            )
+            continue
 
         existing_queues[name] = {"Id": resp.get("QueueId"), "Arn": resp.get("QueueArn"), "Name": name}
         if q.get("id") and resp.get("QueueId"):
             queue_repl.append((q["id"], resp["QueueId"]))
         if q.get("arn") and resp.get("QueueArn"):
             queue_repl.append((q["arn"], resp["QueueArn"]))
+
+    flow_errors: List[Dict[str, Any]] = []
+    module_errors: List[Dict[str, Any]] = []
+    failed_flows = 0
+    failed_modules = 0
+    skipped_unsupported_flows = 0
+    skipped_unsupported_modules = 0
 
     # Existing modules
     existing_modules: Dict[str, Dict[str, Any]] = {}
@@ -388,13 +496,41 @@ def import_bundle(
             if not overwrite:
                 skipped_modules += 1
             else:
+                if skip_unsupported:
+                    reasons = _unsupported_reasons(content0)
+                    if reasons:
+                        skipped_unsupported_modules += 1
+                        if m.get("id"):
+                            module_repl.append((m["id"], existing["Id"]))
+                        if m.get("arn") and existing.get("Arn"):
+                            module_repl.append((m["arn"], existing["Arn"]))
+                        continue
+
                 if not dry_run:
-                    client.update_contact_flow_module_content(
-                        InstanceId=instance_id,
-                        ContactFlowModuleId=existing["Id"],
-                        Content=content0,
-                        Settings=m.get("settings"),
-                    )
+                    try:
+                        client.update_contact_flow_module_content(
+                            **_drop_none(
+                                {
+                                    "InstanceId": instance_id,
+                                    "ContactFlowModuleId": existing["Id"],
+                                    "Content": content0,
+                                    "Settings": m.get("settings"),
+                                }
+                            )
+                        )
+                    except (ClientError, ParamValidationError) as e:
+                        if not continue_on_error:
+                            raise
+                        failed_modules += 1
+                        module_errors.append(
+                            {
+                                "name": name,
+                                "action": "update",
+                                "error": str(e),
+                            }
+                        )
+                        continue
+
                 updated_modules += 1
 
             if m.get("id"):
@@ -407,14 +543,37 @@ def import_bundle(
             created_modules += 1
             continue
 
-        resp = client.create_contact_flow_module(
-            InstanceId=instance_id,
-            Name=name,
-            Description=m.get("description"),
-            Content=content0,
-            Tags=m.get("tags"),
-            Settings=m.get("settings"),
-        )
+        if skip_unsupported:
+            reasons = _unsupported_reasons(content0)
+            if reasons:
+                skipped_unsupported_modules += 1
+                continue
+
+        try:
+            resp = client.create_contact_flow_module(
+                **_drop_none(
+                    {
+                        "InstanceId": instance_id,
+                        "Name": name,
+                        "Description": m.get("description"),
+                        "Content": content0,
+                        "Tags": m.get("tags"),
+                        "Settings": m.get("settings"),
+                    }
+                )
+            )
+        except (ClientError, ParamValidationError) as e:
+            if not continue_on_error:
+                raise
+            failed_modules += 1
+            module_errors.append(
+                {
+                    "name": name,
+                    "action": "create",
+                    "error": str(e),
+                }
+            )
+            continue
         created_modules += 1
 
         existing_modules[name] = {"Id": resp.get("Id"), "Arn": resp.get("Arn"), "Name": name}
@@ -438,6 +597,19 @@ def import_bundle(
     flow_repl: List[Tuple[str, str]] = []
     created_flows = updated_flows = skipped_flows = 0
 
+    # Pre-populate flow replacements for flows that already exist in the target instance.
+    for f0 in bundle.get("contactFlows") or []:
+        name0 = f0.get("name")
+        ftype0 = f0.get("type")
+        if not name0 or not ftype0:
+            continue
+        existing0 = existing_flows.get(f"{ftype0}|{name0}")
+        if existing0 and existing0.get("Id"):
+            if f0.get("id"):
+                flow_repl.append((f0["id"], existing0["Id"]))
+            if f0.get("arn") and existing0.get("Arn"):
+                flow_repl.append((f0["arn"], existing0["Arn"]))
+
     imported_targets: List[Tuple[Dict[str, Any], str]] = []
 
     for f in bundle.get("contactFlows") or []:
@@ -451,45 +623,95 @@ def import_bundle(
 
         raw_content = f.get("content") or "{}"
         content1 = _apply_replacements(
-            _apply_replacements(_apply_replacements(str(raw_content), hours_repl), queue_repl),
-            module_repl,
+            _apply_replacements(
+                _apply_replacements(_apply_replacements(str(raw_content), hours_repl), queue_repl),
+                module_repl,
+            ),
+            flow_repl,
         )
 
         if existing and existing.get("Id"):
             if not overwrite:
                 skipped_flows += 1
             else:
-                if not dry_run:
-                    client.update_contact_flow_content(
-                        InstanceId=instance_id,
-                        ContactFlowId=existing["Id"],
-                        Content=content1,
-                    )
-                updated_flows += 1
+                if skip_unsupported:
+                    reasons = _unsupported_reasons(content1)
+                    if reasons:
+                        skipped_unsupported_flows += 1
+                        if f.get("id"):
+                            flow_repl.append((f["id"], existing["Id"]))
+                        if f.get("arn") and existing.get("Arn"):
+                            flow_repl.append((f["arn"], existing["Arn"]))
+                        continue
+
+                if dry_run:
+                    updated_flows += 1
+                else:
+                    try:
+                        client.update_contact_flow_content(
+                            InstanceId=instance_id,
+                            ContactFlowId=existing["Id"],
+                            Content=content1,
+                        )
+                        updated_flows += 1
+                        imported_targets.append((f, existing["Id"]))
+                    except (ClientError, ParamValidationError) as e:
+                        if not continue_on_error:
+                            raise
+                        failed_flows += 1
+                        flow_errors.append(
+                            {
+                                "name": name,
+                                "type": ftype,
+                                "action": "update",
+                                "error": str(e),
+                            }
+                        )
+                        continue
 
             if f.get("id"):
                 flow_repl.append((f["id"], existing["Id"]))
             if f.get("arn") and existing.get("Arn"):
                 flow_repl.append((f["arn"], existing["Arn"]))
 
-            imported_targets.append((f, existing["Id"]))
             continue
 
         if dry_run:
             created_flows += 1
             continue
 
+        if skip_unsupported:
+            reasons = _unsupported_reasons(content1)
+            if reasons:
+                skipped_unsupported_flows += 1
+                continue
+
         try:
             resp = client.create_contact_flow(
-                InstanceId=instance_id,
-                Name=name,
-                Type=ftype,
-                Description=f.get("description"),
-                Content=content1,
-                Tags=f.get("tags"),
+                **_drop_none(
+                    {
+                        "InstanceId": instance_id,
+                        "Name": name,
+                        "Type": ftype,
+                        "Description": f.get("description"),
+                        "Content": content1,
+                        "Tags": f.get("tags"),
+                    }
+                )
             )
-        except ClientError as e:
-            raise RuntimeError(f"Failed creating contact flow '{name}' ({ftype}): {e}")
+        except (ClientError, ParamValidationError) as e:
+            if not continue_on_error:
+                raise RuntimeError(f"Failed creating contact flow '{name}' ({ftype}): {e}")
+            failed_flows += 1
+            flow_errors.append(
+                {
+                    "name": name,
+                    "type": ftype,
+                    "action": "create",
+                    "error": str(e),
+                }
+            )
+            continue
 
         created_flows += 1
 
@@ -521,27 +743,52 @@ def import_bundle(
                 ),
                 flow_repl,
             )
-            client.update_contact_flow_content(
-                InstanceId=instance_id,
-                ContactFlowId=target_id,
-                Content=content2,
-            )
+            try:
+                client.update_contact_flow_content(
+                    InstanceId=instance_id,
+                    ContactFlowId=target_id,
+                    Content=content2,
+                )
+            except (ClientError, ParamValidationError) as e:
+                if not continue_on_error:
+                    raise
+                failed_flows += 1
+                flow_errors.append(
+                    {
+                        "name": src_flow.get("name"),
+                        "type": src_flow.get("type"),
+                        "action": "secondPassUpdate",
+                        "error": str(e),
+                    }
+                )
 
     return {
         "createdHours": created_hours,
         "updatedHours": updated_hours,
         "skippedHours": skipped_hours,
+        "failedHours": failed_hours,
+        "hoursErrors": hours_errors[:50],
         "createdQueues": created_queues,
         "updatedQueues": updated_queues,
         "skippedQueues": skipped_queues,
+        "failedQueues": failed_queues,
+        "queueErrors": queue_errors[:50],
         "createdModules": created_modules,
         "updatedModules": updated_modules,
         "skippedModules": skipped_modules,
         "createdFlows": created_flows,
         "updatedFlows": updated_flows,
         "skippedFlows": skipped_flows,
+        "skippedUnsupportedFlows": skipped_unsupported_flows,
+        "skippedUnsupportedModules": skipped_unsupported_modules,
+        "failedFlows": failed_flows,
+        "failedModules": failed_modules,
+        "flowErrors": flow_errors[:50],
+        "moduleErrors": module_errors[:50],
         "dryRun": dry_run,
         "overwrite": overwrite,
+        "continueOnError": continue_on_error,
+        "skipUnsupported": skip_unsupported,
     }
 
 
@@ -564,6 +811,16 @@ def build_parser() -> argparse.ArgumentParser:
     imp.add_argument("--in", dest="in_path", required=True, help="Input bundle JSON path")
     imp.add_argument("--overwrite", action="store_true", help="Overwrite (update content) if resource exists")
     imp.add_argument("--dry-run", action="store_true", help="Print what would happen, but do not call Create/Update")
+    imp.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Continue importing after errors (records failures in output)",
+    )
+    imp.add_argument(
+        "--skip-unsupported",
+        action="store_true",
+        help="Skip flows/modules that reference prompts/Lex/Lambda/S3/phone numbers (external deps)",
+    )
 
     return p
 
@@ -593,6 +850,8 @@ def main(argv: List[str]) -> int:
                 bundle=bundle,
                 overwrite=args.overwrite,
                 dry_run=args.dry_run,
+                continue_on_error=args.continue_on_error,
+                skip_unsupported=args.skip_unsupported,
             )
             print(json.dumps(out, indent=2))
             return 0
