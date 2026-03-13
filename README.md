@@ -1,3 +1,16 @@
+# Amazon Connect Replicator
+
+## Repository Layout
+
+- frontend/
+- backend/
+- infra/
+
+## Local vs Deploy
+
+- Local: see docs/how-to.md
+- Deploy: see infra/
+
 ## Proprietary Notice
 
 This code is proprietary to **Maximus**. **No public license is granted**. See [`NOTICE`](./NOTICE).
@@ -989,3 +1002,8 @@ References:
 - Custom agents configuration: https://docs.github.com/en/copilot/reference/custom-agents-configuration
 - Creating custom agents: https://docs.github.com/en/copilot/how-tos/use-copilot-agents/coding-agent/create-custom-agents
 <!-- END COPILOT CUSTOM AGENTS -->
+
+## Copilot skills
+
+Copilot skills were split out to:
+- https://github.com/636137/amazon-connect-replicator-copilot-skills
