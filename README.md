@@ -1,3 +1,9 @@
+## Proprietary Notice
+
+This code is proprietary to **Maximus**. **No public license is granted**. See [`NOTICE`](./NOTICE).
+
+---
+
 # Amazon Connect Replicator (Primitive APIs)
 
 A **best-effort** exporter/importer to replicate Amazon Connect configuration from a source instance (e.g., `us-east-1`) into a **pre-existing** target instance (e.g., `us-west-2`) using Connect's primitive APIs (`List*`/`Describe*` → `Create*`/`Update*`).
